@@ -3644,12 +3644,33 @@ function App(){
     todaysSettlement, isDayLocked,
   };
 
+  // === HOOKS BELOW MUST RUN UNCONDITIONALLY (before any early return) ===
+
+  // Ensure current page is allowed for this role
+  // (early-return inside callback is fine; hook itself must be called every render)
+  useEffect(()=>{
+    if(!currentUser) return;
+    const pages = perms?.pages || [];
+    if(pages.length && !pages.includes(page)){
+      setPage(pages[0] || 'dashboard');
+    }
+  },[role, currentUser, page, perms]);
+
+  // Session expiry → auto-logout (moved out of render path)
+  useEffect(()=>{
+    if(!currentUser) return;
+    const exp = state.auth?.sessionExpiry;
+    if(exp && exp < Date.now()){
+      onLogout();
+    }
+  },[state.auth?.sessionExpiry, currentUser, onLogout]);
+
   // === GATE: not logged in → Login screen ===
   if(!currentUser){
     return (
       <AppCtx.Provider value={ctx}>
         <ThemeInjector theme={state.settings.theme}/>
-      <BrandInjector brand={state.settings.brand} businessName={state.settings.businessName}/>
+        <BrandInjector brand={state.settings.brand} businessName={state.settings.businessName}/>
         <LoginScreen
           users={state.auth?.users||[]}
           onLogin={onLogin}
@@ -3662,10 +3683,6 @@ function App(){
         </div>
       </AppCtx.Provider>
     );
-  }
-  // Session expiry check
-  if(state.auth?.sessionExpiry && state.auth.sessionExpiry < Date.now()){
-    setTimeout(()=> onLogout(), 0);
   }
 
   const NAV_FULL = [
@@ -3680,14 +3697,6 @@ function App(){
   ];
   const allowedPages = perms?.pages || [];
   const NAV = NAV_FULL.filter(n => allowedPages.includes(n.id));
-
-  // Ensure current page is allowed for this role
-  useEffect(()=>{
-    if(!allowedPages.includes(page)){
-      const first = allowedPages[0] || 'dashboard';
-      setPage(first);
-    }
-  },[role]); // eslint-disable-line
 
   const PAGES = {
     dashboard:<Dashboard/>, roast:<RoastModule/>, inventory:<InventoryModule/>,
@@ -4988,6 +4997,16 @@ function StockOpname(){
 function POSModule(){
   const { state, update, toast, t, isDayLocked, setPage } = useApp();
 
+  // === ALL HOOKS MUST RUN BEFORE ANY CONDITIONAL RETURN ===
+  const [cart,setCart] = useState([]);
+  const [customer,setCustomer] = useState('');
+  const [channel,setChannel] = useState('Walk-in');
+  const [search,setSearch] = useState('');
+  const [catFilter,setCatFilter] = useState('');
+  const [paymentOpen,setPaymentOpen] = useState(false);
+  const [lastOrder,setLastOrder] = useState(null);
+  const [cartOpen,setCartOpen] = useState(false);
+
   if(isDayLocked){
     return (
       <div className="col gap-lg" style={{maxWidth:560,margin:'40px auto',textAlign:'center'}}>
@@ -5003,14 +5022,6 @@ function POSModule(){
       </div>
     );
   }
-  const [cart,setCart] = useState([]);
-  const [customer,setCustomer] = useState('');
-  const [channel,setChannel] = useState('Walk-in');
-  const [search,setSearch] = useState('');
-  const [catFilter,setCatFilter] = useState('');
-  const [paymentOpen,setPaymentOpen] = useState(false);
-  const [lastOrder,setLastOrder] = useState(null);
-  const [cartOpen,setCartOpen] = useState(false);
 
   // Close cart on Escape (mobile sheet UX)
   useEffect(()=>{
