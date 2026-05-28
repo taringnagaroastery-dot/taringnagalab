@@ -474,7 +474,14 @@ textarea.input:focus{border-color:var(--accent)}
 .mobile-nav .nav-item{flex-direction:column;gap:4px;padding:10px 8px;font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;font-weight:600;border:none;border-radius:0;opacity:.55;color:var(--text-2)}
 .mobile-nav .nav-item.active{opacity:1;color:var(--accent);border:none;background:transparent}
 .mobile-nav .nav-item.active .ico{color:var(--accent)}
+.mobile-nav .nav-item{position:relative}
 .mobile-nav .nav-item .ico{width:20px;height:20px;color:var(--text-2)}
+/* Mobile "More" overflow sheet */
+.more-sheet{position:fixed;left:0;right:0;bottom:60px;z-index:55;background:var(--bg);border-top:1px solid var(--border-2);border-radius:18px 18px 0 0;box-shadow:0 -16px 40px -10px rgba(0,0,0,.25);max-height:70vh;overflow-y:auto;animation:slideUp .35s cubic-bezier(0.16,1,0.3,1)}
+.more-item{display:flex;align-items:center;gap:14px;padding:16px 22px;cursor:pointer;color:var(--text);font-size:15px;transition:background .2s}
+.more-item:hover,.more-item:active{background:var(--surface)}
+.more-item.active{color:var(--accent);background:var(--surface-hover)}
+.more-item .ico,.more-item svg{color:currentColor;flex:none}
 
 /* === RESPONSIVE === */
 
@@ -1092,7 +1099,7 @@ function newSettlement(date, openedById, openingCash){
   };
 }
 function computeSettlementSnapshot(state, dateISO){
-  const orders = state.orders.filter(o=>o.date===dateISO);
+  const orders = state.orders.filter(o=>o.date===dateISO && (o.status==='paid' || o.status===undefined));
   const byChannel = {}, byPayment = {}, byProduct = {};
   let totalRevenue = 0, totalQty = 0;
   for(const o of orders){
@@ -1182,7 +1189,7 @@ async function exportRevenueXLSX(state, range, t, lang){
   else if(range==='ytd') cutoff.setMonth(0,1);
   else cutoff.setFullYear(2000);
 
-  const inRange = state.orders.filter(o=> new Date(o.date) >= cutoff);
+  const inRange = state.orders.filter(o=> (o.status==='paid' || o.status===undefined) && o.status!=='void' && new Date(o.date) >= cutoff);
   const totalRev = inRange.reduce((s,o)=>s+o.total,0);
   const count = inRange.length;
   const items = inRange.flatMap(o=>o.items||[]);
@@ -1204,7 +1211,7 @@ async function exportRevenueXLSX(state, range, t, lang){
   for(const o of inRange){ perChannel[o.channel||'-'] = (perChannel[o.channel||'-']||0) + o.total; }
 
   const monthly = {};
-  for(const o of state.orders){ const m=o.date.slice(0,7); monthly[m] = (monthly[m]||0)+o.total; }
+  for(const o of state.orders){ if(o.status && o.status!=='paid') continue; const m=o.date.slice(0,7); monthly[m] = (monthly[m]||0)+o.total; }
   const monthsKeys = Object.keys(monthly).sort();
 
   // === Styles ===
@@ -1799,26 +1806,41 @@ function stampUpdatedAt(state){
   };
 }
 
+// Merge two arrays by id, keeping the item with newer updatedAt (prevents
+// losing local items created during the sync round-trip).
+function mergeArraysByTime(localArr, serverArr){
+  const map = {};
+  for(const it of (serverArr||[])){ if(it && it.id) map[it.id] = it; }
+  for(const it of (localArr||[])){
+    if(!it || !it.id) continue;
+    const srv = map[it.id];
+    if(!srv || (+new Date(it.updatedAt||0)) > (+new Date(srv.updatedAt||0))){
+      map[it.id] = it;
+    }
+  }
+  return Object.values(map);
+}
 function mergeStateFromServer(local, merged){
   const out = {};
   for(const key of ['beans','products','roastLogs','cuppings','orders']){
-    out[key] = merged[key] || local[key];
+    out[key] = merged[key] ? mergeArraysByTime(local[key], merged[key]) : local[key];
   }
-  // Users merge with auth wrapper
   if(merged.users){
-    out.auth = { ...local.auth, users: merged.users };
+    out.auth = { ...local.auth, users: mergeArraysByTime(local.auth?.users, merged.users) };
   }
   if(merged.settlements){
-    out.settlements = merged.settlements;
+    out.settlements = mergeArraysByTime(local.settlements, merged.settlements);
   }
   if(merged.customers){
-    out.customers = merged.customers;
+    out.customers = mergeArraysByTime(local.customers, merged.customers);
   }
-  // settings is a single object in local but array on server
+  // settings is a single object in local but array on server — newest wins
   if(Array.isArray(merged.settings) && merged.settings.length){
     const srv = merged.settings.find(x=>x.id==='_settings') || merged.settings[0];
     const { id, ...rest } = srv;
-    out.settings = { ...local.settings, ...rest };
+    const srvTime = +new Date(rest.updatedAt||0);
+    const localTime = +new Date(local.settings?.updatedAt||0);
+    out.settings = srvTime >= localTime ? { ...local.settings, ...rest } : local.settings;
   } else {
     out.settings = local.settings;
   }
@@ -1912,18 +1934,22 @@ const SEED_PRODUCTS = [
   { id:'p6', sku:'TN-ROB-DARK-1000', name:'Robusta Kawi 1kg', brand:'Taring Naga Roastery', category:'Roast Beans', beanId:'b10', roastLevel:'Dark', weight:1000, harga:150000, hargaFinal:150000, diskon:0, stock:6, visible:true, tastingNotes:'Bold, earthy, dark chocolate', mixWith:[] },
   { id:'p7', sku:'FL-KOM-330', name:'Fallen Liquid · Komba 330ml', brand:'Fallen Liquid', category:'Fallen Liquid', beanId:'b2', roastLevel:'—', weight:330, harga:55000, hargaFinal:55000, diskon:0, stock:24, visible:true, tastingNotes:'Fermented coffee, dry, complex', mixWith:[] },
   { id:'p8', sku:'GB-ARJ-1000', name:'Green Bean Arjuna 1kg', brand:'Taring Naga Roastery', category:'Green Beans', beanId:'b2', roastLevel:'—', weight:1000, harga:200000, hargaFinal:200000, diskon:0, stock:20, visible:true, tastingNotes:'Unroasted', mixWith:[] },
-  // === CAFÉ MENU ===
-  { id:'m1', sku:'CF-ESP', name:'Espresso', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:18000, hargaFinal:18000, diskon:0, stock:999, visible:true, tastingNotes:'Single shot', mixWith:[] },
-  { id:'m2', sku:'CF-AMR', name:'Americano', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:22000, hargaFinal:22000, diskon:0, stock:999, visible:true, tastingNotes:'', mixWith:[] },
-  { id:'m3', sku:'CF-LAT', name:'Cafe Latte', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:28000, hargaFinal:28000, diskon:0, stock:999, visible:true, tastingNotes:'', mixWith:[] },
-  { id:'m4', sku:'CF-CAP', name:'Cappuccino', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:28000, hargaFinal:28000, diskon:0, stock:999, visible:true, tastingNotes:'', mixWith:[] },
-  { id:'m5', sku:'CF-V60', name:'V60 Manual Brew', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:30000, hargaFinal:30000, diskon:0, stock:999, visible:true, tastingNotes:'Single origin', mixWith:[] },
-  { id:'m6', sku:'NC-MTC', name:'Matcha Latte', brand:'Cafe', category:'Non-Coffee', beanId:'', roastLevel:'—', weight:0, harga:30000, hargaFinal:30000, diskon:0, stock:999, visible:true, tastingNotes:'', mixWith:[] },
-  { id:'m7', sku:'NC-CHO', name:'Chocolate', brand:'Cafe', category:'Non-Coffee', beanId:'', roastLevel:'—', weight:0, harga:26000, hargaFinal:26000, diskon:0, stock:999, visible:true, tastingNotes:'', mixWith:[] },
+  // === CAFÉ MENU — drinks are made-to-order (stock:null = unlimited/untracked) ===
+  { id:'m1', sku:'CF-ESP', name:'Espresso', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:18000, hargaFinal:18000, diskon:0, stock:null, visible:true, tastingNotes:'Single shot', mixWith:[] },
+  { id:'m2', sku:'CF-AMR', name:'Americano', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:22000, hargaFinal:22000, diskon:0, stock:null, visible:true, tastingNotes:'', mixWith:[] },
+  { id:'m3', sku:'CF-LAT', name:'Cafe Latte', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:28000, hargaFinal:28000, diskon:0, stock:null, visible:true, tastingNotes:'', mixWith:[] },
+  { id:'m4', sku:'CF-CAP', name:'Cappuccino', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:28000, hargaFinal:28000, diskon:0, stock:null, visible:true, tastingNotes:'', mixWith:[] },
+  { id:'m5', sku:'CF-V60', name:'V60 Manual Brew', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:30000, hargaFinal:30000, diskon:0, stock:null, visible:true, tastingNotes:'Single origin', mixWith:[] },
+  { id:'m6', sku:'NC-MTC', name:'Matcha Latte', brand:'Cafe', category:'Non-Coffee', beanId:'', roastLevel:'—', weight:0, harga:30000, hargaFinal:30000, diskon:0, stock:null, visible:true, tastingNotes:'', mixWith:[] },
+  { id:'m7', sku:'NC-CHO', name:'Chocolate', brand:'Cafe', category:'Non-Coffee', beanId:'', roastLevel:'—', weight:0, harga:26000, hargaFinal:26000, diskon:0, stock:null, visible:true, tastingNotes:'', mixWith:[] },
   { id:'m8', sku:'FD-CRS', name:'Croissant', brand:'Cafe', category:'Pastry', beanId:'', roastLevel:'—', weight:0, harga:25000, hargaFinal:25000, diskon:0, stock:30, visible:true, tastingNotes:'Butter', mixWith:[] },
   { id:'m9', sku:'FD-NAS', name:'Nasi Goreng Naga', brand:'Cafe', category:'Food', beanId:'', roastLevel:'—', weight:0, harga:38000, hargaFinal:38000, diskon:0, stock:40, visible:true, tastingNotes:'Spicy', mixWith:[] },
   { id:'m10', sku:'FD-FRF', name:'French Fries', brand:'Cafe', category:'Snack', beanId:'', roastLevel:'—', weight:0, harga:20000, hargaFinal:20000, diskon:0, stock:50, visible:true, tastingNotes:'', mixWith:[] },
 ];
+
+// Stock helpers — null/undefined stock = unlimited (made-to-order)
+function isUnlimitedStock(p){ return p==null || p.stock==null || p.stock===''; }
+function effectiveStock(p){ return isUnlimitedStock(p) ? Infinity : (+p.stock||0); }
 
 function genCurve(){
   const pts=[];
@@ -2154,8 +2180,13 @@ const Store = {
     return defaultStore();
   },
   save(state){
-    try{ localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
-    catch(e){ console.warn('[TN Lab] Store.save failed:', e); }
+    try{ localStorage.setItem(STORE_KEY, JSON.stringify(state)); return true; }
+    catch(e){
+      console.warn('[TN Lab] Store.save failed:', e);
+      // Quota exceeded or storage blocked — notify app to warn user
+      try{ window.dispatchEvent(new CustomEvent('tn:storage-error', { detail:{ message: e.message||String(e) }})); }catch(_){}
+      return false;
+    }
   }
 };
 
@@ -2285,7 +2316,7 @@ function BrandingSection({ s, set, update, state, t, toast }){
 
   return (
     <div>
-      <div className="sec-mark"><span className="label">N° 09 — Branding</span><span className="line"/></div>
+      <div className="sec-mark"><span className="label">N° 05 — Branding</span><span className="line"/></div>
       <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 6px'}}>Branding <em>· identitas app</em></h3>
       <div className="dim" style={{maxWidth:600,lineHeight:1.65,marginBottom:24}}>
         Ganti nama, logo, dan favicon app. Perubahan langsung berlaku — tab browser dan sidebar otomatis update. Disinkronkan ke device lain via spreadsheet.
@@ -2384,7 +2415,7 @@ function ThemeSection({ s, set, update, state, t }){
   }
   return (
     <div>
-      <div className="sec-mark"><span className="label">N° 10 — {t('theme')}</span><span className="line"/></div>
+      <div className="sec-mark"><span className="label">N° 06 — {t('theme')}</span><span className="line"/></div>
       <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 24px'}}>{t('theme')} <em>· custom</em></h3>
       <div className="grid-2">
         <div className="field"><label>{t('theme_mode')}</label>
@@ -2472,7 +2503,7 @@ function ReceiptSection({ s, set, update, state, t, toast }){
 
   return (
     <div>
-      <div className="sec-mark"><span className="label">N° 11 — {t('receipt_custom')}</span><span className="line"/></div>
+      <div className="sec-mark"><span className="label">N° 08 — {t('receipt_custom')}</span><span className="line"/></div>
       <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 24px'}}>{t('receipt_custom')}</h3>
 
       <div className="grid-2">
@@ -2616,7 +2647,7 @@ function CafePOSSection({ s, set, update, state, t, toast }){
 
   return (
     <div>
-      <div className="sec-mark"><span className="label">N° 12B — {t('cafe_pos')}</span><span className="line"/></div>
+      <div className="sec-mark"><span className="label">N° 07 — {t('cafe_pos')}</span><span className="line"/></div>
       <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 16px'}}>{t('cafe_pos')}</h3>
 
       {/* Toggles */}
@@ -2700,7 +2731,7 @@ function SettlementSettingsSection({ s, set, t }){
   function setSL(k,v){ set('settlement', {...sl,[k]:v}); }
   return (
     <div>
-      <div className="sec-mark"><span className="label">N° 12 — {t('settlement')}</span><span className="line"/></div>
+      <div className="sec-mark"><span className="label">N° 09 — {t('settlement')}</span><span className="line"/></div>
       <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 24px'}}>{t('settlement')} <em>· otomatis</em></h3>
       <div className="grid-2">
         <div className="field">
@@ -3760,12 +3791,13 @@ function App(){
   const [state,setState] = useState(()=>Store.load());
   const [page,setPage] = useState(()=>{
     const p = new URLSearchParams(location.search).get('page');
-    return ['dashboard','roast','inventory','pos','reports','settings'].includes(p) ? p : 'dashboard';
+    return ['dashboard','roast','inventory','pos','reports','settlement','users','settings'].includes(p) ? p : 'dashboard';
   });
   const [toasts,setToasts] = useState([]);
   const [installAvailable,setInstallAvailable] = useState(!!window.__deferredInstallPrompt);
   const [printerConnected,setPrinterConnected] = useState(false);
   const [syncTick,setSyncTick] = useState(0);
+  const [moreOpen,setMoreOpen] = useState(false);
   const stateRef = useRef(state);
   useEffect(()=>{ stateRef.current = state; },[state]);
 
@@ -3800,6 +3832,8 @@ function App(){
       if(next.roastLogs) merged.roastLogs = stampList(s.roastLogs, next.roastLogs);
       if(next.cuppings) merged.cuppings = stampList(s.cuppings, next.cuppings);
       if(next.orders) merged.orders = stampList(s.orders, next.orders);
+      if(next.customers) merged.customers = stampList(s.customers, next.customers);
+      if(next.settlements) merged.settlements = stampList(s.settlements, next.settlements);
       if(next.settings) merged.settings = {...s.settings, ...next.settings, updatedAt: now};
       return merged;
     });
@@ -3832,6 +3866,13 @@ function App(){
     };
     window.addEventListener('tn:sw-update', onUpdate);
     return ()=> window.removeEventListener('tn:sw-update', onUpdate);
+  },[toast]);
+
+  // Storage quota / error notification
+  useEffect(()=>{
+    const onErr = (e) => toast('Penyimpanan penuh! Data terakhir gagal disimpan. Export backup & hapus data lama (Settings → Data).', 'err');
+    window.addEventListener('tn:storage-error', onErr);
+    return ()=> window.removeEventListener('tn:storage-error', onErr);
   },[toast]);
   const triggerInstall = useCallback(async ()=>{
     const ev = window.__deferredInstallPrompt;
@@ -3952,7 +3993,7 @@ function App(){
     });
   },[state.roastLogs,state.cuppings]);
 
-  const lowStock = useMemo(()=> state.products.filter(p=>p.stock <= state.settings.lowStockThreshold && p.visible), [state.products,state.settings]);
+  const lowStock = useMemo(()=> state.products.filter(p=>!isUnlimitedStock(p) && p.stock <= state.settings.lowStockThreshold && p.visible), [state.products,state.settings]);
 
   const lang = state.settings.language || 'id';
   const t = useMemo(()=> makeT(lang), [lang]);
@@ -4174,12 +4215,41 @@ function App(){
             </div>
           </div>
           <nav className="mobile-nav">
-            {NAV.slice(0,5).map(n=>(
-              <div key={n.id} className={"nav-item "+(page===n.id?'active':'')} onClick={()=>setPage(n.id)}>
+            {(NAV.length<=5 ? NAV : NAV.slice(0,4)).map(n=>(
+              <div key={n.id} className={"nav-item "+(page===n.id?'active':'')} onClick={()=>{setMoreOpen(false);setPage(n.id);}}>
                 <I className="ico" name={n.icon} size={20}/> {n.label}
+                {n.badge ? <span style={{position:'absolute',top:4,right:'calc(50% - 18px)',background:'var(--accent)',color:'#fff',fontSize:8,borderRadius:8,padding:'0 4px',fontWeight:700}}>{n.badge}</span> : null}
               </div>
             ))}
+            {NAV.length>5 && (
+              <div className={"nav-item "+(NAV.slice(4).some(n=>n.id===page)?'active':'')} onClick={()=>setMoreOpen(o=>!o)}>
+                <I className="ico" name="menu" size={20}/> More
+              </div>
+            )}
           </nav>
+
+          {/* Mobile "More" overflow sheet */}
+          {moreOpen && (
+            <>
+              <div className="cart-backdrop show no-print" style={{zIndex:54}} onClick={()=>setMoreOpen(false)}/>
+              <div className="more-sheet no-print">
+                <div className="pos-cart-h" style={{position:'relative'}}>
+                  <div className="label">Menu Lainnya</div>
+                </div>
+                <div style={{padding:'8px 0 16px'}}>
+                  {NAV.slice(4).map(n=>(
+                    <div key={n.id} className={"more-item "+(page===n.id?'active':'')} onClick={()=>{setPage(n.id);setMoreOpen(false);}}>
+                      <I name={n.icon} size={18}/> <span>{n.label}</span>
+                      {n.badge ? <span className="badge" style={{marginLeft:'auto',background:'var(--accent)',color:'#fff',fontSize:10,borderRadius:8,padding:'1px 7px',fontWeight:700}}>{n.badge}</span> : null}
+                    </div>
+                  ))}
+                  <div className="more-item" onClick={()=>{setMoreOpen(false);onLogout();}} style={{color:'var(--danger)',borderTop:'1px solid var(--border)',marginTop:6}}>
+                    <I name="close" size={18}/> <span>{t('logout')}</span>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
         </main>
       </div>
 
@@ -4200,10 +4270,11 @@ function Dashboard(){
   const openBillsList = state.orders.filter(o=>o.status==='open');
   const openBillsCount = openBillsList.length;
   const openBillsTotal = openBillsList.reduce((s,o)=>s+o.total,0);
+  const isPaid = o => (o.status==='paid' || o.status===undefined);
 
-  const monthOrders = state.orders.filter(o=>o.date.slice(0,7)===month);
+  const monthOrders = state.orders.filter(o=>isPaid(o) && o.date.slice(0,7)===month);
   const monthRev = monthOrders.reduce((s,o)=>s+o.total,0);
-  const todayOrders = state.orders.filter(o=>o.date===today);
+  const todayOrders = state.orders.filter(o=>isPaid(o) && o.date===today);
   const todayRev = todayOrders.reduce((s,o)=>s+o.total,0);
   const progress = Math.min(100,(monthRev/state.settings.monthlyTarget)*100);
 
@@ -4684,7 +4755,11 @@ function RoastSession({initial,onClose}){
         }
       }
     });
+    return ()=>{ if(chartInst.current){ chartInst.current.destroy(); chartInst.current=null; } };
   },[curve,tp]);
+
+  // Cleanup timer on unmount
+  useEffect(()=> ()=>{ if(tickRef.current) clearInterval(tickRef.current); }, []);
 
   function fmtElapsed(s){ const m=Math.floor(s/60), ss=s%60; return `${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`; }
 
@@ -5053,7 +5128,7 @@ function InventoryModule(){
                     <td>{p.roastLevel!=='—' ? <span className="roast-pill" style={{'--bg':ROAST_COLORS[p.roastLevel]}}>{p.roastLevel}</span> : <span className="muted">—</span>}</td>
                     <td className="mono dim">{p.weight}g</td>
                     <td className="mono" style={{color:'var(--accent)'}}>{fmtIDR(p.hargaFinal)}</td>
-                    <td className="mono" style={{color: p.stock<=state.settings.lowStockThreshold?'var(--warn)':'var(--text)'}}>{p.stock}</td>
+                    <td className="mono" style={{color: isUnlimitedStock(p)?'var(--text-3)': p.stock<=state.settings.lowStockThreshold?'var(--warn)':'var(--text)'}}>{isUnlimitedStock(p)?'∞':p.stock}</td>
                     <td>{p.visible ? <span className="pill ok">Visible</span> : <span className="pill">Hidden</span>}</td>
                     <td><button className="btn sm ghost icon" onClick={e=>{e.stopPropagation();setEditing(p);}}><I name="edit" size={13}/></button></td>
                   </tr>
@@ -5376,8 +5451,8 @@ function StockOpname(){
     toast(`Opname tersimpan. ${changed.length} produk diperbarui.`,'ok');
   }
 
-  // Group filtered products by category
-  const filtered = state.products.filter(p=> catFilter ? p.category===catFilter : true);
+  // Group filtered products by category (only tracked-stock items)
+  const filtered = state.products.filter(p=> !isUnlimitedStock(p) && (catFilter ? p.category===catFilter : true));
   const grouped = {};
   for(const p of filtered){ (grouped[p.category||'Lainnya'] ??= []).push(p); }
 
@@ -5431,6 +5506,7 @@ function applyInventoryDelta(products, oldItems, newItems){
   return products.map(p => {
     const d = delta[p.id];
     if(!d) return p;
+    if(isUnlimitedStock(p)) return p; // made-to-order: don't track
     return { ...p, stock: Math.max(0, (p.stock||0) - d) };
   });
 }
@@ -5474,8 +5550,8 @@ function POSModule(){
   const enableOpenBill = state.settings.enableOpenBill !== false;
   const enableTables = state.settings.enableTables !== false;
 
-  // Menu, grouped by category
-  const visible = useMemo(()=> state.products.filter(p=>p.visible && p.stock>0
+  // Menu, grouped by category (unlimited-stock items always shown)
+  const visible = useMemo(()=> state.products.filter(p=>p.visible && (isUnlimitedStock(p) || p.stock>0)
     && (catFilter? p.category===catFilter : true)
     && (search? p.name.toLowerCase().includes(search.toLowerCase()) : true)), [state.products,catFilter,search]);
   const grouped = useMemo(()=>{
@@ -5530,7 +5606,8 @@ function POSModule(){
     const items = cart.map(c=>({...c, subtotal: c.price*c.qty}));
     const now = new Date();
     return {
-      id: editingBill?.id || 'o'+Date.now(),
+      id: editingBill?.id || ('o'+Date.now()+Math.floor(Math.random()*1000)),
+      updatedAt: now.toISOString(),
       date: editingBill?.date || todayISO(),
       time: editingBill?.time || now.toTimeString().slice(0,5),
       openedAt: editingBill?.openedAt || now.toISOString(),
@@ -5655,7 +5732,7 @@ function POSModule(){
                   <div className="name">{p.name}</div>
                   {p.roastLevel && p.roastLevel!=='—' && <span className="roast-pill" style={{'--bg':ROAST_COLORS[p.roastLevel],marginTop:6}}>{p.roastLevel}</span>}
                   <div className="price">{fmtIDR(p.hargaFinal)}</div>
-                  {p.stock<999 && <div className="tiny dim mt-sm" style={{fontFamily:'var(--mono)',letterSpacing:'.1em'}}>Stok {p.stock}</div>}
+                  {!isUnlimitedStock(p) && <div className="tiny dim mt-sm" style={{fontFamily:'var(--mono)',letterSpacing:'.1em',color: p.stock<=state.settings.lowStockThreshold?'var(--warn)':undefined}}>Stok {p.stock}</div>}
                 </div>
               ))}
             </div>
@@ -5915,7 +5992,8 @@ function ReportsModule(){
   if(range==='ytd') cutoff.setMonth(0,1);
   if(range==='all') cutoff.setFullYear(2000);
 
-  const inRange = state.orders.filter(o=> new Date(o.date) >= cutoff);
+  // Only PAID orders count as revenue (exclude open bills & voided)
+  const inRange = state.orders.filter(o=> (o.status==='paid' || o.status===undefined) && o.status!=='void' && new Date(o.date) >= cutoff);
   const total = inRange.reduce((s,o)=>s+o.total,0);
   const count = inRange.length;
   const avg = count? total/count : 0;
@@ -5931,7 +6009,7 @@ function ReportsModule(){
   const perChannel = {};
   for(const o of inRange){ perChannel[o.channel] = (perChannel[o.channel]||0) + o.total; }
   const monthly={};
-  for(const o of state.orders){ const m=o.date.slice(0,7); monthly[m]=(monthly[m]||0)+o.total; }
+  for(const o of state.orders){ if(o.status && o.status!=='paid') continue; const m=o.date.slice(0,7); monthly[m]=(monthly[m]||0)+o.total; }
   const months = Object.keys(monthly).sort();
 
   const chart1 = useRef(null), chart2 = useRef(null), chart3 = useRef(null);
@@ -6211,7 +6289,7 @@ function SettingsModule(){
   return (
     <div className="col gap-lg">
       <div>
-        <div className="sec-mark"><span className="label">N° 00 — {t('language')}</span><span className="line"/></div>
+        <div className="sec-mark"><span className="label">N° 01 — {t('language')}</span><span className="line"/></div>
         <h3 style={{fontSize:'clamp(22px, 2.4vw, 30px)',margin:'10px 0 18px'}}>{t('language')}</h3>
         <div className="row" style={{gap:0}}>
           <button className={"btn "+(s.language==='id'?'primary':'ghost')} onClick={()=>{ set('language','id'); update({settings:{...state.settings,language:'id'}}); }}>
@@ -6223,22 +6301,8 @@ function SettingsModule(){
         </div>
       </div>
 
-      {/* BRANDING — admin/owner only with canEditBranding */}
-      {(currentUser?.role === 'admin' || getPerms(state.settings, currentUser?.role).canEditBranding) && (
-        <BrandingSection s={s} set={set} update={update} state={state} t={t} toast={toast}/>
-      )}
-
-      {/* THEME — palette + density + sidebar pos */}
-      <ThemeSection s={s} set={set} update={update} state={state} t={t}/>
-
-      {/* RECEIPT custom */}
-      <ReceiptSection s={s} set={set} update={update} state={state} t={t} toast={toast}/>
-
-      {/* SETTLEMENT settings */}
-      <SettlementSettingsSection s={s} set={set} t={t}/>
-
       <div>
-        <div className="sec-mark"><span className="label">N° 01 — {t('business_info')}</span><span className="line"/></div>
+        <div className="sec-mark"><span className="label">N° 02 — {t('business_info')}</span><span className="line"/></div>
         <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 24px'}}>{t('business_info')}</h3>
         <div className="grid-2">
           <div className="field"><label>Nama Bisnis</label><input className="input" value={s.businessName} onChange={e=>set('businessName',e.target.value)}/></div>
@@ -6251,7 +6315,7 @@ function SettingsModule(){
       </div>
 
       <div>
-        <div className="sec-mark"><span className="label">N° 02 — Pricing</span><span className="line"/></div>
+        <div className="sec-mark"><span className="label">N° 03 — Pricing</span><span className="line"/></div>
         <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 24px'}}>Parameter <em>harga</em></h3>
         <div className="grid-3">
           <div className="field"><label>Markup %</label><input className="input mono" type="number" value={s.markupPct} onChange={e=>set('markupPct',+e.target.value)}/></div>
@@ -6263,7 +6327,7 @@ function SettingsModule(){
       </div>
 
       <div>
-        <div className="sec-mark"><span className="label">N° 03 — Target</span><span className="line"/></div>
+        <div className="sec-mark"><span className="label">N° 04 — Target</span><span className="line"/></div>
         <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 24px'}}>Pencapaian</h3>
         <div className="grid-2">
           <div className="field"><label>Target Bulanan (Rp)</label><input className="input mono" type="number" value={s.monthlyTarget} onChange={e=>set('monthlyTarget',+e.target.value)}/></div>
@@ -6272,11 +6336,20 @@ function SettingsModule(){
       </div>
 
       <div className="row" style={{justifyContent:'flex-end'}}>
-        <button className="btn primary" onClick={save}><I name="check" size={12}/>Simpan Settings</button>
+        <button className="btn primary" onClick={save}><I name="check" size={12}/>{t('save_settings')}</button>
       </div>
 
+      {/* Appearance & café config — live-applied */}
+      {(currentUser?.role === 'admin' || getPerms(state.settings, currentUser?.role).canEditBranding) && (
+        <BrandingSection s={s} set={set} update={update} state={state} t={t} toast={toast}/>
+      )}
+      <ThemeSection s={s} set={set} update={update} state={state} t={t}/>
+      <CafePOSSection s={s} set={set} update={update} state={state} t={t} toast={toast}/>
+      <ReceiptSection s={s} set={set} update={update} state={state} t={t} toast={toast}/>
+      <SettlementSettingsSection s={s} set={set} t={t}/>
+
       <div>
-        <div className="sec-mark"><span className="label">N° 04 — PWA</span><span className="line"/></div>
+        <div className="sec-mark"><span className="label">N° 10 — PWA</span><span className="line"/></div>
         <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 24px'}}>Install ke <em>Home Screen</em></h3>
         <div className="grid-2">
           <div>
@@ -6302,7 +6375,7 @@ function SettingsModule(){
       </div>
 
       <div>
-        <div className="sec-mark"><span className="label">N° 05 — Sync & Database</span><span className="line"/></div>
+        <div className="sec-mark"><span className="label">N° 11 — Sync & Database</span><span className="line"/></div>
         <div className="row" style={{justifyContent:'space-between',flexWrap:'wrap',gap:10}}>
           <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 0'}}>Google Spreadsheet · <em>multi-device</em></h3>
           <Toggle
@@ -6363,7 +6436,7 @@ function SettingsModule(){
       </div>
 
       <div>
-        <div className="sec-mark"><span className="label">N° 06 — Webhook (Web → POS)</span><span className="line"/></div>
+        <div className="sec-mark"><span className="label">N° 12 — Webhook (Web → POS)</span><span className="line"/></div>
         <div className="row" style={{justifyContent:'space-between',flexWrap:'wrap',gap:10}}>
           <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 0'}}>Auto-import order <em>taringnaga.id</em></h3>
           <Toggle
@@ -6408,7 +6481,7 @@ function SettingsModule(){
       </div>
 
       <div>
-        <div className="sec-mark"><span className="label">N° 07 — Thermal Printer</span><span className="line"/></div>
+        <div className="sec-mark"><span className="label">N° 13 — Thermal Printer</span><span className="line"/></div>
         <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 16px'}}>Print struk via <em>Bluetooth</em></h3>
         <div className="dim" style={{lineHeight:1.7,maxWidth:680,marginBottom:18}}>
           Native ESC/POS Bluetooth — Bixolon, Eppos, Xprinter, atau generic 58mm/80mm.
@@ -6451,11 +6524,8 @@ function SettingsModule(){
         </div>
       </div>
 
-      {/* CAFÉ POS — print stations + categories */}
-      <CafePOSSection s={s} set={set} update={update} state={state} t={t} toast={toast}/>
-
       <div>
-        <div className="sec-mark"><span className="label">N° 13 — Data</span><span className="line"/></div>
+        <div className="sec-mark"><span className="label">N° 14 — Data</span><span className="line"/></div>
         <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 24px'}}>Backup & <em>Restore</em></h3>
         <div className="row">
           <button className="btn" onClick={exportData}><I name="download" size={12}/>Export JSON</button>
@@ -6470,7 +6540,7 @@ function SettingsModule(){
       </div>
 
       <div>
-        <div className="sec-mark"><span className="label">N° 09 — Tentang</span><span className="line"/></div>
+        <div className="sec-mark"><span className="label">N° 15 — Tentang</span><span className="line"/></div>
         <h3 style={{fontSize:'clamp(28px, 3.5vw, 42px)',margin:'10px 0 14px'}}>Taring Naga <em>Lab</em> v1.0</h3>
         <div className="hero-quote" style={{borderLeft:'1px solid var(--gold)',paddingLeft:18,maxWidth:560}}>Slow-roasted. Naturally rooted. <em>Coffee with a bite.</em></div>
         <div className="dim mt-md" style={{maxWidth:600,lineHeight:1.7}}>Operations Suite untuk roastery — Roast Log, Inventory & Pricing, P.O.S, dan Pembukuan. PWA installable, sync via Google Spreadsheet, webhook untuk integrasi web order, dan native ESC/POS Bluetooth printer. Siap dijual sebagai produk turnkey untuk roaster Indonesia.</div>
