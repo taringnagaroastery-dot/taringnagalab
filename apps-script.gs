@@ -24,7 +24,7 @@
 const SHEET_ID = 'PASTE_YOUR_GOOGLE_SHEET_ID_HERE';
 const SHARED_SECRET = 'CHANGE_THIS_TO_A_LONG_RANDOM_STRING';
 
-const ENTITIES = ['beans', 'products', 'roastLogs', 'cuppings', 'orders', 'users', 'settlements', 'settings'];
+const ENTITIES = ['beans', 'products', 'roastLogs', 'cuppings', 'orders', 'users', 'settlements', 'customers', 'settings'];
 
 /* ===================== HTTP Endpoints ===================== */
 

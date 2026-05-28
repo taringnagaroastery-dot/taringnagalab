@@ -42,8 +42,28 @@
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('./sw.js', { scope: './' })
-      .then(reg => { window.__swReg = reg; })
+      .then(reg => {
+        window.__swReg = reg;
+        // Detect new SW version
+        reg.addEventListener('updatefound', () => {
+          const newWorker = reg.installing;
+          if(!newWorker) return;
+          newWorker.addEventListener('statechange', () => {
+            if(newWorker.state === 'installed' && navigator.serviceWorker.controller){
+              window.dispatchEvent(new CustomEvent('tn:sw-update', { detail: { reg, worker:newWorker }}));
+            }
+          });
+        });
+      })
       .catch(err => console.warn('SW register failed:', err));
+    // Detect controller change (new SW took over)
+    let refreshing = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if(refreshing) return;
+      refreshing = true;
+      // Soft notification — don't auto-reload to avoid losing user work
+      window.dispatchEvent(new CustomEvent('tn:sw-activated'));
+    });
   });
 }
 // Capture install prompt for later use
@@ -936,6 +956,20 @@ Object.assign(I18N.id, {
   // Settlement settings
   enable_settlement:'Aktifkan Settlement', cutoff_time:'Waktu Cutoff (otomatis)', opening_time:'Waktu Buka',
   require_opening_cash:'Wajib Input Kas Awal', lock_on_pending:'Kunci POS saat Pending',
+  // Café POS
+  order_tab:'Order', open_bills_tab:'Open Bill', customer:'Customer', table_no:'No. Meja', table:'Meja',
+  pay_now:'Bayar Sekarang', save_bill:'Simpan Bill', open_bill:'Open Bill', finalize:'Selesaikan & Bayar',
+  add_to_bill:'Tambah ke Bill', new_order:'Order Baru', bill_saved:'Bill disimpan untuk',
+  no_open_bills:'Tidak ada open bill.', open_since:'Dibuka', items_count:'item',
+  unpaid_bills:'Tagihan Belum Bayar', unpaid_total:'Total Belum Bayar', open_bills_count:'open bill',
+  print_stations:'Print Station', add_station:'Tambah Station', station_name:'Nama Station',
+  station_categories:'Kategori (item yang dicetak)', print_kitchen:'Print Kitchen/Bar', connect_station_printer:'Connect Printer Station',
+  customers_mgmt:'Customer', search_customer:'Cari nama customer…', last_visit:'Kunjungan Terakhir',
+  visit_count:'Jumlah Kunjungan', total_spent:'Total Belanja', prune_months:'Auto-hapus customer tidak aktif (bulan)',
+  void_bill:'Batalkan Bill', confirm_void:'Batalkan bill ini?', settle_open_warn:'Masih ada {0} open bill belum dibayar (total {1}). Tutup hari tetap?',
+  category:'Kategori', all_categories:'Semua Kategori', menu_item:'Menu Item',
+  cafe_pos:'Café POS', tables_enable:'Aktifkan No. Meja', openbill_enable:'Aktifkan Open Bill',
+  add_note:'Catatan item', recent_customers:'Customer Terakhir',
 });
 
 Object.assign(I18N.en, {
@@ -974,6 +1008,20 @@ Object.assign(I18N.en, {
   reset_theme:'Reset to Default',
   enable_settlement:'Enable Settlement', cutoff_time:'Cutoff Time (auto)', opening_time:'Opening Time',
   require_opening_cash:'Require Opening Cash', lock_on_pending:'Lock POS on Pending',
+  // Café POS
+  order_tab:'Order', open_bills_tab:'Open Bills', customer:'Customer', table_no:'Table No.', table:'Table',
+  pay_now:'Pay Now', save_bill:'Save Bill', open_bill:'Open Bill', finalize:'Finalize & Pay',
+  add_to_bill:'Add to Bill', new_order:'New Order', bill_saved:'Bill saved for',
+  no_open_bills:'No open bills.', open_since:'Opened', items_count:'items',
+  unpaid_bills:'Unpaid Bills', unpaid_total:'Total Unpaid', open_bills_count:'open bills',
+  print_stations:'Print Stations', add_station:'Add Station', station_name:'Station Name',
+  station_categories:'Categories (items to print)', print_kitchen:'Print Kitchen/Bar', connect_station_printer:'Connect Station Printer',
+  customers_mgmt:'Customers', search_customer:'Search customer name…', last_visit:'Last Visit',
+  visit_count:'Visit Count', total_spent:'Total Spent', prune_months:'Auto-delete inactive customers (months)',
+  void_bill:'Void Bill', confirm_void:'Void this bill?', settle_open_warn:'{0} open bills still unpaid (total {1}). Close day anyway?',
+  category:'Category', all_categories:'All Categories', menu_item:'Menu Item',
+  cafe_pos:'Café POS', tables_enable:'Enable Table No.', openbill_enable:'Enable Open Bill',
+  add_note:'Item note', recent_customers:'Recent Customers',
 });
 
 /* ============================================================
@@ -1117,6 +1165,9 @@ async function renderChartPNG(config, w=1200, h=500){
 }
 
 async function exportRevenueXLSX(state, range, t, lang){
+  if(typeof ExcelJS === 'undefined' || !ExcelJS?.Workbook){
+    throw new Error('ExcelJS belum termuat. Pastikan koneksi internet aktif untuk download library.');
+  }
   const wb = new ExcelJS.Workbook();
   wb.creator = state.settings.businessName || 'Taring Naga Lab';
   wb.created = new Date();
@@ -1452,6 +1503,97 @@ class BluetoothPrinter {
 
 const printerSingleton = new BluetoothPrinter();
 
+/* Multi-printer manager — keyed by station id (for kitchen/bar/etc) */
+const printerManager = {
+  printers: {},  // stationId -> BluetoothPrinter
+  get(stationId){
+    if(!this.printers[stationId]) this.printers[stationId] = new BluetoothPrinter();
+    return this.printers[stationId];
+  },
+  isConnected(stationId){ return this.printers[stationId]?.connected || false; },
+};
+
+/* Kitchen/Bar station ticket (no prices, large fonts, item + qty + notes) */
+function buildStationTicketBytes(order, stationName, items, width=32){
+  const out = [];
+  const push = b => Array.isArray(b) ? out.push(...b) : out.push(b);
+  const line = s => { push(encAscii(s)); push(ESC.LF); };
+  const sep = () => line('='.repeat(width));
+
+  push(ESC.INIT); push(ESC.CHARSET); push(ESC.CODEPAGE_CP437);
+  push(ESC.ALIGN_C); push(ESC.TXT_2WH); push(ESC.BOLD_ON);
+  line(stationName.toUpperCase());
+  push(ESC.TXT_NORMAL); push(ESC.BOLD_OFF);
+  sep();
+  push(ESC.ALIGN_L);
+  line('No   : ' + (order.id||'').slice(-6).toUpperCase());
+  if(order.tableNo) { push(ESC.TXT_2H); push(ESC.BOLD_ON); line('MEJA : ' + order.tableNo); push(ESC.TXT_NORMAL); push(ESC.BOLD_OFF); }
+  line('Cust : ' + (order.customer||'-'));
+  line('Time : ' + (order.time || new Date().toTimeString().slice(0,5)));
+  sep();
+  for(const it of items){
+    push(ESC.TXT_2H); push(ESC.BOLD_ON);
+    line(`${it.qty}x ${it.name}`);
+    push(ESC.TXT_NORMAL); push(ESC.BOLD_OFF);
+    if(it.note){ line('   * ' + it.note); }
+  }
+  sep();
+  push(ESC.FEED(3)); push(ESC.CUT);
+  return new Uint8Array(out);
+}
+
+/* Route order items to print stations by category */
+function routeItemsToStations(items, stations, products){
+  const productById = {};
+  for(const p of (products||[])) productById[p.id] = p;
+  const result = [];
+  for(const st of (stations||[])){
+    if(!st.enabled) continue;
+    const cats = st.categories || [];
+    const matched = items.filter(it => {
+      const prod = productById[it.productId];
+      const cat = prod?.category || it.category;
+      return cats.includes('*') || cats.includes(cat);
+    });
+    if(matched.length) result.push({ station: st, items: matched });
+  }
+  return result;
+}
+
+/* ============================================================
+   CUSTOMER MEMORY helpers
+   ============================================================ */
+function normName(s){ return (s||'').trim().toLowerCase().replace(/\s+/g,' '); }
+
+function upsertCustomer(customers, name, phone){
+  const key = normName(name);
+  if(!key) return { customers, customer:null };
+  const now = new Date().toISOString();
+  const existing = customers.find(c => normName(c.name) === key);
+  if(existing){
+    const updated = { ...existing, lastVisit: now, visitCount:(existing.visitCount||0)+1, phone: phone||existing.phone, updatedAt:now };
+    return { customers: customers.map(c=>c.id===existing.id?updated:c), customer: updated };
+  }
+  const fresh = {
+    id:'cust_'+Date.now()+Math.floor(Math.random()*1000),
+    name: name.trim(), phone: phone||'',
+    lastVisit: now, visitCount:1, totalSpent:0, notes:'',
+    createdAt: now, updatedAt: now,
+  };
+  return { customers: [...customers, fresh], customer: fresh };
+}
+
+function pruneInactiveCustomers(customers, months){
+  if(!months || months<=0) return { kept: customers, removed: [] };
+  const cutoff = Date.now() - months*30*24*60*60*1000;
+  const kept = [], removed = [];
+  for(const c of customers){
+    const last = c.lastVisit ? new Date(c.lastVisit).getTime() : new Date(c.createdAt||0).getTime();
+    if(last < cutoff) removed.push(c); else kept.push(c);
+  }
+  return { kept, removed };
+}
+
 function encAscii(s){
   const out = [];
   for(const ch of (s||'')){
@@ -1602,6 +1744,7 @@ const SyncSvc = {
           orders: stamped.orders,
           users: (localState.auth?.users||[]).map(u => ({...u, updatedAt: u.updatedAt||new Date().toISOString()})),
           settlements: (localState.settlements||[]).map(s => ({...s, updatedAt: s.updatedAt||new Date().toISOString()})),
+          customers: (localState.customers||[]).map(c => ({...c, updatedAt: c.updatedAt||new Date().toISOString()})),
           settings: [{ id:'_settings', ...stamped.settings, updatedAt: stamped.settings.updatedAt || new Date().toISOString() }],
         }
       };
@@ -1667,6 +1810,9 @@ function mergeStateFromServer(local, merged){
   }
   if(merged.settlements){
     out.settlements = merged.settlements;
+  }
+  if(merged.customers){
+    out.customers = merged.customers;
   }
   // settings is a single object in local but array on server
   if(Array.isArray(merged.settings) && merged.settings.length){
@@ -1766,6 +1912,17 @@ const SEED_PRODUCTS = [
   { id:'p6', sku:'TN-ROB-DARK-1000', name:'Robusta Kawi 1kg', brand:'Taring Naga Roastery', category:'Roast Beans', beanId:'b10', roastLevel:'Dark', weight:1000, harga:150000, hargaFinal:150000, diskon:0, stock:6, visible:true, tastingNotes:'Bold, earthy, dark chocolate', mixWith:[] },
   { id:'p7', sku:'FL-KOM-330', name:'Fallen Liquid · Komba 330ml', brand:'Fallen Liquid', category:'Fallen Liquid', beanId:'b2', roastLevel:'—', weight:330, harga:55000, hargaFinal:55000, diskon:0, stock:24, visible:true, tastingNotes:'Fermented coffee, dry, complex', mixWith:[] },
   { id:'p8', sku:'GB-ARJ-1000', name:'Green Bean Arjuna 1kg', brand:'Taring Naga Roastery', category:'Green Beans', beanId:'b2', roastLevel:'—', weight:1000, harga:200000, hargaFinal:200000, diskon:0, stock:20, visible:true, tastingNotes:'Unroasted', mixWith:[] },
+  // === CAFÉ MENU ===
+  { id:'m1', sku:'CF-ESP', name:'Espresso', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:18000, hargaFinal:18000, diskon:0, stock:999, visible:true, tastingNotes:'Single shot', mixWith:[] },
+  { id:'m2', sku:'CF-AMR', name:'Americano', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:22000, hargaFinal:22000, diskon:0, stock:999, visible:true, tastingNotes:'', mixWith:[] },
+  { id:'m3', sku:'CF-LAT', name:'Cafe Latte', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:28000, hargaFinal:28000, diskon:0, stock:999, visible:true, tastingNotes:'', mixWith:[] },
+  { id:'m4', sku:'CF-CAP', name:'Cappuccino', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:28000, hargaFinal:28000, diskon:0, stock:999, visible:true, tastingNotes:'', mixWith:[] },
+  { id:'m5', sku:'CF-V60', name:'V60 Manual Brew', brand:'Cafe', category:'Coffee', beanId:'', roastLevel:'—', weight:0, harga:30000, hargaFinal:30000, diskon:0, stock:999, visible:true, tastingNotes:'Single origin', mixWith:[] },
+  { id:'m6', sku:'NC-MTC', name:'Matcha Latte', brand:'Cafe', category:'Non-Coffee', beanId:'', roastLevel:'—', weight:0, harga:30000, hargaFinal:30000, diskon:0, stock:999, visible:true, tastingNotes:'', mixWith:[] },
+  { id:'m7', sku:'NC-CHO', name:'Chocolate', brand:'Cafe', category:'Non-Coffee', beanId:'', roastLevel:'—', weight:0, harga:26000, hargaFinal:26000, diskon:0, stock:999, visible:true, tastingNotes:'', mixWith:[] },
+  { id:'m8', sku:'FD-CRS', name:'Croissant', brand:'Cafe', category:'Pastry', beanId:'', roastLevel:'—', weight:0, harga:25000, hargaFinal:25000, diskon:0, stock:30, visible:true, tastingNotes:'Butter', mixWith:[] },
+  { id:'m9', sku:'FD-NAS', name:'Nasi Goreng Naga', brand:'Cafe', category:'Food', beanId:'', roastLevel:'—', weight:0, harga:38000, hargaFinal:38000, diskon:0, stock:40, visible:true, tastingNotes:'Spicy', mixWith:[] },
+  { id:'m10', sku:'FD-FRF', name:'French Fries', brand:'Cafe', category:'Snack', beanId:'', roastLevel:'—', weight:0, harga:20000, hargaFinal:20000, diskon:0, stock:50, visible:true, tastingNotes:'', mixWith:[] },
 ];
 
 function genCurve(){
@@ -1917,6 +2074,15 @@ const defaultStore = () => ({
     // Allow self-signup from Login screen (admin-controlled)
     allowSelfSignup: false,
     defaultSignupRole: 'pegawai',
+    // Café POS
+    categories: ['Coffee','Non-Coffee','Food','Snack','Pastry','Roast Beans','Green Beans','Fallen Liquid'],
+    enableOpenBill: true,
+    enableTables: true,
+    customerPruneMonths: 2,
+    printStations: [
+      { id:'st_kitchen', name:'Kitchen', categories:['Food','Snack','Pastry'], enabled:true },
+      { id:'st_bar', name:'Bar', categories:['Coffee','Non-Coffee'], enabled:true },
+    ],
     // Brand customization
     brand: {
       appName: 'Taring Naga Lab',
@@ -1935,6 +2101,7 @@ const defaultStore = () => ({
   },
   settlements: [],
   movements: [],            // inventory movement log
+  customers: [],            // customer memory
   beans: SEED_BEANS,
   products: SEED_PRODUCTS,
   roastLogs: SEED_LOGS,
@@ -1968,6 +2135,7 @@ const Store = {
           orders: Array.isArray(parsed.orders) ? parsed.orders : def.orders,
           settlements: Array.isArray(parsed.settlements) ? parsed.settlements : def.settlements,
           movements: Array.isArray(parsed.movements) ? parsed.movements : def.movements,
+          customers: Array.isArray(parsed.customers) ? parsed.customers : def.customers,
         };
         // Sanity guard: ensure auth.users is array; current user has valid role
         if(!Array.isArray(merged.auth.users)) merged.auth.users = [];
@@ -2090,7 +2258,8 @@ function BrandingSection({ s, set, update, state, t, toast }){
   function setBrand(k,v){
     const nb = {...brand,[k]:v};
     set('brand', nb);
-    update({ settings: { ...state.settings, brand: nb } }); // apply live
+    // PARTIAL update — only brand field, preserve other pending edits in s
+    update({ settings: { brand: nb } });
   }
   function onLogoUpload(e){
     const f = e.target.files[0]; if(!f) return;
@@ -2110,7 +2279,7 @@ function BrandingSection({ s, set, update, state, t, toast }){
     if(!confirm('Reset branding ke default Taring Naga?')) return;
     const def = { appName:'Taring Naga Lab', appLogo:'', faviconData:'', useCustomLogo:false, useCustomFavicon:false, sidebarSub:'Lab · Ops', loginQuote:'"Kopi yang baik punya gigi."' };
     set('brand', def);
-    update({ settings: { ...state.settings, brand: def } });
+    update({ settings: { brand: def } });
     toast('Branding direset','ok');
   }
 
@@ -2206,12 +2375,12 @@ function ThemeSection({ s, set, update, state, t }){
   function setTheme(k,v){
     const nt = {...theme,[k]:v};
     set('theme', nt);
-    update({ settings: { ...state.settings, theme: nt } }); // apply live
+    update({ settings: { theme: nt } }); // partial — preserve other pending form edits
   }
   function resetTheme(){
     const def = { mode:'cotton', accentColor:'#5a0f1a', goldColor:'#c9a961', cottonColor:'#f5efe6', maroonDeepColor:'#3d0810', density:'comfortable', sidebarPos:'left' };
     set('theme', def);
-    update({ settings: { ...state.settings, theme: def } });
+    update({ settings: { theme: def } });
   }
   return (
     <div>
@@ -2396,6 +2565,136 @@ function ReceiptSection({ s, set, update, state, t, toast }){
   );
 }
 
+function CafePOSSection({ s, set, update, state, t, toast }){
+  const stations = s.printStations || [];
+  const categories = s.categories || [];
+  const [newCat,setNewCat] = useState('');
+  const [stTick,setStTick] = useState(0); // re-render after connect
+
+  function setStations(next){ set('printStations', next); update({settings:{printStations:next}}); }
+  function addStation(){
+    const st = { id:'st_'+Date.now(), name:'Station '+(stations.length+1), categories:[], enabled:true };
+    setStations([...stations, st]);
+  }
+  function updateStation(id, patch){ setStations(stations.map(x=>x.id===id?{...x,...patch}:x)); }
+  function delStation(id){ if(confirm('Hapus station?')) setStations(stations.filter(x=>x.id!==id)); }
+  function toggleStationCat(id, cat){
+    const st = stations.find(x=>x.id===id); if(!st) return;
+    const cats = st.categories||[];
+    updateStation(id, { categories: cats.includes(cat)? cats.filter(c=>c!==cat) : [...cats, cat] });
+  }
+  async function connectStationPrinter(id){
+    try{
+      const p = printerManager.get(id);
+      const info = await p.connect();
+      setStTick(t=>t+1);
+      toast('Printer station terkoneksi: '+info.name,'ok');
+    }catch(e){ toast('Connect gagal: '+e.message,'err'); }
+  }
+  async function testStation(id){
+    const p = printerManager.get(id);
+    if(!p.connected){ toast('Printer station belum terkoneksi','warn'); return; }
+    const st = stations.find(x=>x.id===id);
+    try{
+      await p.send(buildStationTicketBytes({id:'TEST01', customer:'Test', tableNo:'1', time:new Date().toTimeString().slice(0,5)}, st.name, [{name:'Test Item', qty:2, note:'extra hot'}], s.printerWidth||32));
+      toast('Test ticket terkirim','ok');
+    }catch(e){ toast('Test gagal: '+e.message,'err'); }
+  }
+
+  function addCategory(){
+    const c = newCat.trim();
+    if(!c) return;
+    if(categories.includes(c)){ toast('Kategori sudah ada','warn'); return; }
+    const next = [...categories, c];
+    set('categories', next); update({settings:{categories:next}});
+    setNewCat('');
+  }
+  function delCategory(c){
+    const next = categories.filter(x=>x!==c);
+    set('categories', next); update({settings:{categories:next}});
+  }
+
+  return (
+    <div>
+      <div className="sec-mark"><span className="label">N° 12B — {t('cafe_pos')}</span><span className="line"/></div>
+      <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 16px'}}>{t('cafe_pos')}</h3>
+
+      {/* Toggles */}
+      <div className="grid-2 mb-md">
+        <label className="checkbox"><input type="checkbox" checked={s.enableOpenBill!==false} onChange={e=>{set('enableOpenBill',e.target.checked);update({settings:{enableOpenBill:e.target.checked}});}}/>{t('openbill_enable')}</label>
+        <label className="checkbox"><input type="checkbox" checked={s.enableTables!==false} onChange={e=>{set('enableTables',e.target.checked);update({settings:{enableTables:e.target.checked}});}}/>{t('tables_enable')}</label>
+        <div className="field"><label>{t('prune_months')}</label>
+          <input className="input mono" type="number" min="0" value={s.customerPruneMonths ?? 2} onChange={e=>{const v=+e.target.value;set('customerPruneMonths',v);update({settings:{customerPruneMonths:v}});}}/>
+        </div>
+      </div>
+
+      {/* Categories */}
+      <div className="mt-md">
+        <div className="label">{t('category')}</div>
+        <div className="row mt-sm" style={{flexWrap:'wrap',gap:8}}>
+          {categories.map(c=>(
+            <span key={c} className="pill" style={{paddingRight:4}}>{c}
+              <button className="btn sm ghost icon" style={{width:20,height:20,padding:0,marginLeft:4}} onClick={()=>delCategory(c)}><I name="close" size={10}/></button>
+            </span>
+          ))}
+        </div>
+        <div className="row mt-sm" style={{maxWidth:360}}>
+          <input className="input" value={newCat} onChange={e=>setNewCat(e.target.value)} placeholder="Tambah kategori…" onKeyDown={e=>e.key==='Enter'&&addCategory()}/>
+          <button className="btn sm" onClick={addCategory}><I name="plus" size={11}/>Add</button>
+        </div>
+      </div>
+
+      {/* Print Stations */}
+      <div className="mt-lg">
+        <div className="row" style={{justifyContent:'space-between',alignItems:'center'}}>
+          <div className="label">{t('print_stations')}</div>
+          <button className="btn sm primary" onClick={addStation}><I name="plus" size={11}/>{t('add_station')}</button>
+        </div>
+        <div className="dim tiny mt-sm" style={{maxWidth:600,lineHeight:1.6}}>
+          Setiap station cetak hanya item dengan kategori yang dipilih. Connect printer Bluetooth per station (kitchen, bar, dll) — atau fallback ke printer utama. Saat order, ticket otomatis terkirim ke station relevan.
+        </div>
+        <div className="col gap-md mt-md">
+          {stations.map(st=>{
+            const connected = printerManager.isConnected(st.id);
+            return (
+              <div key={st.id} className="card" style={{padding:16}}>
+                <div className="row" style={{justifyContent:'space-between',flexWrap:'wrap',gap:10}}>
+                  <div className="row" style={{flex:1,minWidth:200}}>
+                    <input className="input" value={st.name} onChange={e=>updateStation(st.id,{name:e.target.value})} style={{maxWidth:200,fontFamily:'var(--display)',fontSize:18}}/>
+                    <label className="checkbox"><input type="checkbox" checked={st.enabled!==false} onChange={e=>updateStation(st.id,{enabled:e.target.checked})}/>Aktif</label>
+                  </div>
+                  <div className="row">
+                    <span className="pill" style={{color: connected?'var(--ok)':'var(--text-3)', borderColor: connected?'rgba(94,138,78,.5)':'var(--border-2)'}}>
+                      {connected?'Connected':'No printer'}
+                    </span>
+                    <button className="btn sm" onClick={()=>connectStationPrinter(st.id)}><I name="print" size={11}/>Connect</button>
+                    {connected && <button className="btn sm ghost" onClick={()=>testStation(st.id)}>Test</button>}
+                    <button className="btn sm danger icon" onClick={()=>delStation(st.id)}><I name="trash" size={11}/></button>
+                  </div>
+                </div>
+                <div className="mt-md">
+                  <div className="tiny dim mb-sm">{t('station_categories')}:</div>
+                  <div className="row" style={{flexWrap:'wrap',gap:6}}>
+                    {categories.map(cat=>{
+                      const on = (st.categories||[]).includes(cat);
+                      return (
+                        <button key={cat} type="button" className={"btn sm "+(on?'primary':'ghost')} onClick={()=>toggleStationCat(st.id, cat)} style={{fontSize:11,textTransform:'none',letterSpacing:'.04em',fontFamily:'var(--sans)'}}>
+                          {on&&<I name="check" size={10}/>}{cat}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+          {stations.length===0 && <div className="muted tiny">Belum ada print station. Tambah untuk routing ticket kitchen/bar.</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SettlementSettingsSection({ s, set, t }){
   const sl = s.settlement || {};
   function setSL(k,v){ set('settlement', {...sl,[k]:v}); }
@@ -2522,8 +2821,8 @@ function ReceiptRender({ order, settings }){
    SETTLEMENT MODULE
    ============================================================ */
 function SettlementModule(){
-  const { state, update, toast, t, currentUser, perms, todaysSettlement } = useApp();
-  const [openingCash,setOpeningCash] = useState(state.settings.settlement?.defaultOpeningCash || 500000);
+  const { state, update, toast, t, currentUser, perms, todaysSettlement, setPage } = useApp();
+  const [openingCash,setOpeningCash] = useState(state.settings.settlement?.defaultOpeningCash ?? 500000);
   const [closingCash,setClosingCash] = useState('');
   const [notes,setNotes] = useState('');
   const [history,setHistory] = useState(false);
@@ -2531,21 +2830,36 @@ function SettlementModule(){
   const snapshot = useMemo(()=> computeSettlementSnapshot(state, todayISO()), [state.orders]);
   const expectedCash = (todaysSettlement?.openingCash||0) + (snapshot.byPayment?.Cash||0);
   const diff = (+closingCash||0) - expectedCash;
+  const openBills = useMemo(()=> state.orders.filter(o=>o.status==='open'), [state.orders]);
+  const openBillsTotal = openBills.reduce((s,o)=>s+o.total,0);
 
   function openDay(){
     if(todaysSettlement){ toast('Hari sudah dibuka','warn'); return; }
-    const s = newSettlement(todayISO(), currentUser.id, openingCash);
+    const cash = Math.max(0, +openingCash||0);
+    if(state.settings.settlement?.requireOpeningCash && cash<=0 && openingCash!=='0' && openingCash!==0){
+      toast('Kas awal wajib diisi','warn'); return;
+    }
+    const s = newSettlement(todayISO(), currentUser.id, cash);
     update(st => ({ settlements: [...st.settlements, s] }));
-    toast(`${t('open_day')} · ${fmtIDR(openingCash)}`,'ok');
+    toast(`${t('open_day')} · ${fmtIDR(cash)}`,'ok');
   }
   function closeDay(){
     if(!todaysSettlement){ toast('Belum dibuka','warn'); return; }
+    // Guard: warn if open bills still unpaid
+    const openBills = state.orders.filter(o=>o.status==='open');
+    if(openBills.length){
+      const openTotal = openBills.reduce((s,o)=>s+o.total,0);
+      if(!confirm(t('settle_open_warn', openBills.length, fmtIDR(openTotal)))) return;
+    }
+    if(closingCash==='' || closingCash==null){
+      if(!confirm('Closing cash kosong — anggap 0?')) return;
+    }
     if(!confirm(t('confirm_close_day'))) return;
     const snap = computeSettlementSnapshot(state, todayISO());
     update(st => ({
       settlements: st.settlements.map(s => s.id===todaysSettlement.id ? {
         ...s, status:'closed', closedAt:new Date().toISOString(), closedBy:currentUser.id,
-        closingCash:+closingCash||0, notes, snapshot:snap, updatedAt:new Date().toISOString()
+        closingCash:Math.max(0,+closingCash||0), notes, snapshot:snap, updatedAt:new Date().toISOString()
       } : s)
     }));
     toast(`${t('close_day')} · ${todayISO()}`,'ok');
@@ -2575,6 +2889,27 @@ function SettlementModule(){
         {todaysSettlement?.openedAt && <span className="tiny dim">Buka: {new Date(todaysSettlement.openedAt).toLocaleString('id-ID')}</span>}
         {todaysSettlement?.closedAt && <span className="tiny dim">Tutup: {new Date(todaysSettlement.closedAt).toLocaleString('id-ID')}</span>}
       </div>
+
+      {/* Open bills warning — receivables */}
+      {openBills.length>0 && (
+        <div className="card" style={{borderColor:'rgba(168,119,38,.4)',background:'rgba(168,119,38,.05)'}}>
+          <div className="row" style={{justifyContent:'space-between',flexWrap:'wrap',gap:12,alignItems:'center'}}>
+            <div className="row gap-md">
+              <I name="bell" color="var(--warn)" size={20}/>
+              <div>
+                <div className="label" style={{color:'var(--warn)'}}>{t('unpaid_bills')}</div>
+                <div className="bright" style={{fontSize:16,marginTop:2}}>{openBills.length} {t('open_bills_count')} · {t('unpaid_total')} <span className="mono" style={{color:'var(--warn)'}}>{fmtIDR(openBillsTotal)}</span></div>
+              </div>
+            </div>
+            <button className="btn" onClick={()=>setPage('pos')}><I name="pos" size={12}/>{t('open_bills_tab')}</button>
+          </div>
+          <div className="row mt-md" style={{flexWrap:'wrap',gap:8}}>
+            {openBills.slice(0,8).map(o=>(
+              <span key={o.id} className="pill warn">{o.tableNo?`#${o.tableNo} `:''}{o.customer} · {fmtIDR(o.total)}</span>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* No settlement yet — open day */}
       {!todaysSettlement && (
@@ -2778,7 +3113,13 @@ function RolesEditor(){
   function togglePage(role, page){
     const r = perms[role] || {};
     const pages = r.pages || [];
-    const next = pages.includes(page) ? pages.filter(p=>p!==page) : [...pages, page];
+    const isRemoving = pages.includes(page);
+    // Guard: prevent admin from locking themselves out of users/settings
+    if(role === 'admin' && isRemoving && (page === 'users' || page === 'settings')){
+      toast('Admin tidak bisa kehilangan akses ke Users/Settings — bisa terkunci permanen','warn');
+      return;
+    }
+    const next = isRemoving ? pages.filter(p=>p!==page) : [...pages, page];
     updatePerm(role, 'pages', next);
   }
   function deleteRole(role){
@@ -2960,20 +3301,33 @@ function UserEditor({user, onClose, onDelete, roleLabels}){
 
   async function save(){
     setErr('');
-    if(!username){ setErr('Username required'); return; }
-    if(isNew && !password){ setErr('Password required'); return; }
+    if(!username || !username.trim()){ setErr('Username wajib'); return; }
+    const uname = username.trim().toLowerCase();
+    if(!/^[a-z0-9_.-]+$/.test(uname)){ setErr('Username hanya boleh huruf, angka, _ . -'); return; }
+    if(isNew && (!password || password.length<4)){ setErr('Password min 4 karakter'); return; }
+    if(password && password.length>0 && password.length<4){ setErr('Password min 4 karakter'); return; }
     if(password && password!==confirmPw){ setErr(t('password_mismatch')); return; }
-    // Check duplicate
-    if((state.auth.users||[]).some(u=>u.username===username.toLowerCase() && u.id!==user.id)){ setErr(t('user_exists')); return; }
-    const passHash = password ? await hashPassword(password) : user.passHash;
-    const finalUser = isNew
-      ? makeUser({ username, displayName: displayName||username, role, passHash, active })
-      : { ...user, username:username.toLowerCase(), displayName, role, active, passHash, updatedAt:new Date().toISOString() };
-    update(s => ({
-      auth: { ...s.auth, users: isNew ? [...s.auth.users, finalUser] : s.auth.users.map(u=>u.id===finalUser.id?finalUser:u) }
-    }));
-    toast(isNew? t('user_created'):'Updated','ok');
-    onClose();
+    if((state.auth.users||[]).some(u=>u.username===uname && u.id!==user.id)){ setErr(t('user_exists')); return; }
+    // Guard: don't allow deactivating self
+    if(!isNew && user.id === currentUser.id && !active){
+      setErr('Tidak bisa deaktivasi diri sendiri'); return;
+    }
+    // Guard: don't allow last admin to demote/deactivate themselves
+    if(!isNew && user.id === currentUser.id && currentUser.role === 'admin' && role !== 'admin'){
+      const adminCount = state.auth.users.filter(u=>u.role==='admin' && u.active).length;
+      if(adminCount<=1){ setErr('Minimal 1 admin aktif harus ada — tidak bisa ubah role admin terakhir'); return; }
+    }
+    try{
+      const passHash = password ? await hashPassword(password) : user.passHash;
+      const finalUser = isNew
+        ? makeUser({ username:uname, displayName: displayName||uname, role, passHash, active })
+        : { ...user, username:uname, displayName: displayName||uname, role, active, passHash, updatedAt:new Date().toISOString() };
+      update(s => ({
+        auth: { ...s.auth, users: isNew ? [...s.auth.users, finalUser] : s.auth.users.map(u=>u.id===finalUser.id?finalUser:u) }
+      }));
+      toast(isNew? t('user_created'):'User diperbarui','ok');
+      onClose();
+    }catch(e){ setErr('Gagal: '+e.message); }
   }
 
   return (
@@ -3244,7 +3598,15 @@ function LoginScreen({ users, onLogin, onSetupAdmin, t, settings }){
   const [password,setPassword] = useState('');
   const [confirmPw,setConfirmPw] = useState('');
   const [displayName,setDisplayName] = useState('');
-  const [role,setRole] = useState(isFirstTime ? 'admin' : (settings.defaultSignupRole || 'pegawai'));
+  // Default role selection — first user = admin; else from setting (validated)
+  const initialRole = useMemo(()=>{
+    if(isFirstTime) return 'admin';
+    const all = getAllRoles(settings);
+    const wanted = settings.defaultSignupRole || 'pegawai';
+    return all.includes(wanted) ? wanted : (all[0] || 'pegawai');
+  },[isFirstTime, settings]);
+  const [role,setRole] = useState(initialRole);
+  useEffect(()=>{ setRole(initialRole); },[initialRole]);
   const [err,setErr] = useState('');
   const [loading,setLoading] = useState(false);
 
@@ -3460,6 +3822,17 @@ function App(){
       window.removeEventListener('tn:installed', onInstalled);
     };
   },[]);
+
+  // SW update notification
+  useEffect(()=>{
+    const onUpdate = (e) => {
+      const w = e.detail?.worker;
+      toast('Versi baru tersedia — reload untuk apply', 'warn');
+      window.__swNewWorker = w;
+    };
+    window.addEventListener('tn:sw-update', onUpdate);
+    return ()=> window.removeEventListener('tn:sw-update', onUpdate);
+  },[toast]);
   const triggerInstall = useCallback(async ()=>{
     const ev = window.__deferredInstallPrompt;
     if(!ev) { toast('Install belum tersedia. Coba menu browser → "Add to Home Screen".','warn'); return; }
@@ -3544,6 +3917,20 @@ function App(){
     const tick = setInterval(()=> setPrinterConnected(printerSingleton.connected), 1500);
     return ()=> clearInterval(tick);
   },[]);
+
+  // Auto-prune inactive customers (run once on mount)
+  const prunedRef = useRef(false);
+  useEffect(()=>{
+    if(prunedRef.current) return;
+    prunedRef.current = true;
+    const months = state.settings.customerPruneMonths;
+    if(!months || months<=0) return;
+    const { kept, removed } = pruneInactiveCustomers(state.customers||[], months);
+    if(removed.length){
+      setState(s => ({ ...s, customers: kept }));
+      setTimeout(()=> toast(`${removed.length} customer tidak aktif >${months} bulan dihapus otomatis`, 'warn'), 1500);
+    }
+  },[]); // eslint-disable-line
 
   const manualSync = useCallback(async ()=>{
     try{
@@ -3810,6 +4197,9 @@ function Dashboard(){
   const { state, pendingCuppings, lowStock, setPage, t } = useApp();
   const today = todayISO();
   const month = today.slice(0,7);
+  const openBillsList = state.orders.filter(o=>o.status==='open');
+  const openBillsCount = openBillsList.length;
+  const openBillsTotal = openBillsList.reduce((s,o)=>s+o.total,0);
 
   const monthOrders = state.orders.filter(o=>o.date.slice(0,7)===month);
   const monthRev = monthOrders.reduce((s,o)=>s+o.total,0);
@@ -3884,7 +4274,7 @@ function Dashboard(){
         <Reveal d="1">
           <div className="sec-mark"><span className="label">N° 03 — {t('reminder')}</span><span className="line"/></div>
           <h3 style={{fontSize:28,margin:'6px 0 22px'}}>{t('need_attention')}</h3>
-          {pendingCuppings.length===0 && lowStock.length===0 && (
+          {pendingCuppings.length===0 && lowStock.length===0 && openBillsCount===0 && (
             <div className="muted" style={{padding:'40px 0',textAlign:'center'}}>{t('all_clear')}</div>
           )}
           <div className="col gap-sm">
@@ -3908,6 +4298,16 @@ function Dashboard(){
                 <button className="btn sm" onClick={()=>setPage('inventory')}>Restock</button>
               </div>
             ))}
+            {openBillsCount>0 && (
+              <div style={{display:'flex',gap:14,padding:'16px 0',borderBottom:'1px solid var(--border)',alignItems:'center'}}>
+                <I name="pos" color="var(--warn)" size={16}/>
+                <div style={{flex:1}}>
+                  <div className="bright">{openBillsCount} {t('unpaid_bills')}</div>
+                  <div className="tiny dim mt-sm">{t('unpaid_total')} {fmtIDR(openBillsTotal)}</div>
+                </div>
+                <button className="btn sm" onClick={()=>setPage('pos')}>{t('open')}</button>
+              </div>
+            )}
           </div>
         </Reveal>
       </div>
@@ -4632,7 +5032,7 @@ function InventoryModule(){
             <input className="input" placeholder="Cari produk / SKU…" value={search} onChange={e=>setSearch(e.target.value)} style={{flex:1,minWidth:200,maxWidth:340}}/>
             <select className="select" value={catFilter} onChange={e=>setCatFilter(e.target.value)} style={{maxWidth:180}}>
               <option value="">Semua Kategori</option>
-              <option>Green Beans</option><option>Roast Beans</option><option>Fallen Liquid</option>
+              {(state.settings.categories||[]).map(c=> <option key={c} value={c}>{c}</option>)}
             </select>
             <div style={{flex:1}}/>
             <button className="btn primary" onClick={()=>setEditing({_new:true})}><I name="plus" size={12}/>Product</button>
@@ -4709,13 +5109,18 @@ function ProductEditor({product, onClose}){
   }
 
   function save(){
+    // Validation
+    if(origin==='single' && !beanId){ toast('Pilih bean dulu','warn'); return; }
+    if(origin==='mix' && (!mixWith || mixWith.length===0)){ toast('Pilih minimal 1 bean untuk blend','warn'); return; }
+    if(!weight || +weight<=0){ toast('Berat harus lebih dari 0','warn'); return; }
+    if(!hargaOverride || +hargaOverride<=0){ toast('Harga jual harus lebih dari 0','warn'); return; }
     const sku = product.sku || generateSKU();
     const p = {
       id: product.id || 'p'+Date.now(),
-      sku, name: name || `${bean?.name||''} ${weight}g`,
+      sku, name: (name||'').trim() || `${bean?.name||''} ${weight}g`.trim(),
       brand, category, beanId, roastLevel, weight:+weight,
-      harga:+hargaOverride, hargaFinal: finalPrice, diskon:+diskon,
-      stock:+stock, visible, tastingNotes: tasting,
+      harga:+hargaOverride, hargaFinal: finalPrice, diskon:+diskon||0,
+      stock:+stock||0, visible, tastingNotes: tasting,
       mixWith, origin
     };
     update(s=>({
@@ -4754,7 +5159,7 @@ function ProductEditor({product, onClose}){
             </div>
             <div className="field"><label>Kategori</label>
               <select className="select" value={category} onChange={e=>setCategory(e.target.value)}>
-                <option>Green Beans</option><option>Roast Beans</option><option>Fallen Liquid</option>
+                {(state.settings.categories||['Roast Beans']).map(c=> <option key={c} value={c}>{c}</option>)}
               </select>
             </div>
             <div className="field"><label>Variant Origin</label>
@@ -4892,12 +5297,14 @@ function BeanEditor({bean,onClose}){
   const [autoRecalc,setAutoRecalc] = useState(true);
   function set(k,v){ setB(s=>({...s,[k]:v})); }
   function save(){
-    const final = {...b, id: b.id || 'b'+Date.now(), hargaBeli:+b.hargaBeli, susut:+b.susut, qty:+b.qty};
+    if(!b.name || !b.name.trim()){ toast('Nama bean wajib','warn'); return; }
+    if(!b.hargaBeli || +b.hargaBeli <= 0){ toast('Harga beli harus lebih dari 0','warn'); return; }
+    const final = {...b, id: b.id || 'b'+Date.now(), name:b.name.trim(), hargaBeli:+b.hargaBeli, susut:+b.susut||0, qty:+b.qty||0};
     const oldHarga = bean.hargaBeli;
     const oldSusut = bean.susut;
     const priceChanged = !isNew && (final.hargaBeli !== oldHarga || final.susut !== oldSusut);
     update(s=>{
-      const beans = isNew ? [...s.beans, final] : s.beans.map(x=>x.id===final.id?x===bean?final:final:x);
+      const beans = isNew ? [...s.beans, final] : s.beans.map(x => x.id===final.id ? final : x);
       let products = s.products;
       // === INVENTORY SYNC: auto-recalc product prices using this bean ===
       if(priceChanged && autoRecalc){
@@ -4952,60 +5359,130 @@ function BeanEditor({bean,onClose}){
 }
 
 function StockOpname(){
-  const { state, update, toast } = useApp();
+  const { state, update, toast, t } = useApp();
   const [draft,setDraft] = useState(()=>Object.fromEntries(state.products.map(p=>[p.id, p.stock])));
   const [checked,setChecked] = useState({});
+  const [catFilter,setCatFilter] = useState('');
 
   function commit(){
-    const changed = Object.keys(draft).filter(id=> draft[id] !== state.products.find(p=>p.id===id)?.stock);
+    const changed = Object.keys(draft).filter(id=>{
+      const orig = state.products.find(p=>p.id===id)?.stock;
+      return draft[id] !== '' && +draft[id] !== +(orig||0);
+    });
     if(changed.length===0){ toast('Tidak ada perubahan stok','warn'); return; }
-    update(s=>({ products: s.products.map(p=> draft[p.id]!=null ? {...p, stock:+draft[p.id]} : p) }));
+    if(!confirm(`Commit opname? ${changed.length} produk akan di-update.`)) return;
+    update(s=>({ products: s.products.map(p=> (draft[p.id]!=null && draft[p.id]!=='') ? {...p, stock:+draft[p.id]} : p) }));
+    setChecked({});
     toast(`Opname tersimpan. ${changed.length} produk diperbarui.`,'ok');
   }
 
+  // Group filtered products by category
+  const filtered = state.products.filter(p=> catFilter ? p.category===catFilter : true);
+  const grouped = {};
+  for(const p of filtered){ (grouped[p.category||'Lainnya'] ??= []).push(p); }
+
   return (
     <div className="col gap-md">
-      <div className="row" style={{padding:'8px 0',borderBottom:'1px solid var(--border)'}}>
+      <div className="row" style={{padding:'8px 0',borderBottom:'1px solid var(--border)',flexWrap:'wrap'}}>
         <div className="label">Audit Stok</div>
+        <select className="select" value={catFilter} onChange={e=>setCatFilter(e.target.value)} style={{maxWidth:180}}>
+          <option value="">{t('all_categories')}</option>
+          {(state.settings.categories||[]).map(c=> <option key={c} value={c}>{c}</option>)}
+        </select>
         <div style={{flex:1}}/>
         <button className="btn primary" onClick={commit}><I name="check" size={12}/>Commit Opname</button>
       </div>
-      <table className="tbl">
-        <thead><tr><th>✓</th><th>Produk</th><th>Sistem</th><th>Fisik</th><th>Selisih</th></tr></thead>
-        <tbody>
-          {state.products.map(p=>{
-            const sel = +draft[p.id]||0; const diff = sel - p.stock;
-            return (
-              <tr key={p.id}>
-                <td><label className="checkbox"><input type="checkbox" checked={!!checked[p.id]} onChange={e=>setChecked({...checked,[p.id]:e.target.checked})}/></label></td>
-                <td style={{fontFamily:'var(--display)',fontSize:17,color:'var(--text)'}}>{p.name} <span className="tiny dim mono" style={{fontFamily:'var(--mono)',fontSize:11}}>· {p.sku}</span></td>
-                <td className="mono dim">{p.stock}</td>
-                <td><input className="input mono" type="number" value={draft[p.id]} onChange={e=>setDraft({...draft,[p.id]:e.target.value})} style={{maxWidth:90}}/></td>
-                <td className="mono" style={{color: diff===0?'var(--text-3)': diff>0?'var(--ok)':'var(--danger)'}}>{diff>0?'+':''}{diff}</td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+      <div style={{overflowX:'auto'}}>
+        <table className="tbl">
+          <thead><tr><th>✓</th><th>Produk</th><th>Kategori</th><th>Sistem</th><th>Fisik</th><th>Selisih</th></tr></thead>
+          <tbody>
+            {Object.entries(grouped).map(([cat,prods])=>(
+              <React.Fragment key={cat}>
+                <tr><td colSpan={6} style={{background:'var(--bg-2)',padding:'8px 14px'}}><span className="label">{cat} · {prods.length}</span></td></tr>
+                {prods.map(p=>{
+                  const sel = +draft[p.id]||0; const diff = sel - p.stock;
+                  return (
+                    <tr key={p.id}>
+                      <td><label className="checkbox"><input type="checkbox" checked={!!checked[p.id]} onChange={e=>setChecked({...checked,[p.id]:e.target.checked})}/></label></td>
+                      <td style={{fontFamily:'var(--display)',fontSize:17,color:'var(--text)'}}>{p.name} <span className="tiny dim mono" style={{fontFamily:'var(--mono)',fontSize:11}}>· {p.sku}</span></td>
+                      <td><span className="pill">{p.category}</span></td>
+                      <td className="mono dim">{p.stock}</td>
+                      <td><input className="input mono" type="number" value={draft[p.id]} onChange={e=>setDraft({...draft,[p.id]:e.target.value})} style={{maxWidth:90}}/></td>
+                      <td className="mono" style={{color: diff===0?'var(--text-3)': diff>0?'var(--ok)':'var(--danger)'}}>{diff>0?'+':''}{diff}</td>
+                    </tr>
+                  );
+                })}
+              </React.Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
 
 /* ============================================================
-   POS MODULE
+   POS MODULE — café: open bill, customer memory, multi-printer
    ============================================================ */
+function applyInventoryDelta(products, oldItems, newItems){
+  const delta = {};
+  for(const it of (newItems||[])) delta[it.productId] = (delta[it.productId]||0) + it.qty;
+  for(const it of (oldItems||[])) delta[it.productId] = (delta[it.productId]||0) - it.qty;
+  return products.map(p => {
+    const d = delta[p.id];
+    if(!d) return p;
+    return { ...p, stock: Math.max(0, (p.stock||0) - d) };
+  });
+}
+function deltaItems(oldItems, newItems){
+  const oldMap = {}; for(const it of (oldItems||[])) oldMap[it.productId]=(oldMap[it.productId]||0)+it.qty;
+  const out = [];
+  for(const it of (newItems||[])){
+    const prevQ = oldMap[it.productId]||0;
+    const addQ = it.qty - prevQ;
+    if(addQ > 0) out.push({...it, qty:addQ});
+  }
+  return out;
+}
+
 function POSModule(){
   const { state, update, toast, t, isDayLocked, setPage } = useApp();
 
-  // === ALL HOOKS MUST RUN BEFORE ANY CONDITIONAL RETURN ===
+  // === ALL HOOKS BEFORE ANY CONDITIONAL RETURN ===
+  const [tab,setTab] = useState('order');
   const [cart,setCart] = useState([]);
   const [customer,setCustomer] = useState('');
+  const [tableNo,setTableNo] = useState('');
   const [channel,setChannel] = useState('Walk-in');
   const [search,setSearch] = useState('');
   const [catFilter,setCatFilter] = useState('');
   const [paymentOpen,setPaymentOpen] = useState(false);
   const [lastOrder,setLastOrder] = useState(null);
   const [cartOpen,setCartOpen] = useState(false);
+  const [editingBill,setEditingBill] = useState(null); // open bill being edited (snapshot)
+
+  useEffect(()=>{
+    if(!cartOpen) return;
+    const h = e => { if(e.key==='Escape') setCartOpen(false); };
+    window.addEventListener('keydown', h);
+    return ()=> window.removeEventListener('keydown', h);
+  },[cartOpen]);
+
+  const subtotal = cart.reduce((s,x)=>s+x.price*x.qty,0);
+  const openBills = useMemo(()=> state.orders.filter(o=>o.status==='open'), [state.orders]);
+  const categories = state.settings.categories || [];
+  const enableOpenBill = state.settings.enableOpenBill !== false;
+  const enableTables = state.settings.enableTables !== false;
+
+  // Menu, grouped by category
+  const visible = useMemo(()=> state.products.filter(p=>p.visible && p.stock>0
+    && (catFilter? p.category===catFilter : true)
+    && (search? p.name.toLowerCase().includes(search.toLowerCase()) : true)), [state.products,catFilter,search]);
+  const grouped = useMemo(()=>{
+    const g = {};
+    for(const p of visible){ (g[p.category||'Lainnya'] ??= []).push(p); }
+    return g;
+  },[visible]);
 
   if(isDayLocked){
     return (
@@ -5015,116 +5492,193 @@ function POSModule(){
         <h2 style={{fontSize:'clamp(28px, 4vw, 42px)',color:'var(--accent)'}}>{t('pos_locked')}</h2>
         <div className="dim" style={{lineHeight:1.7}}>{t('pos_locked_msg')}</div>
         <div className="row" style={{justifyContent:'center',marginTop:16}}>
-          <button className="btn" onClick={()=>setPage('settlement')}>
-            <I name="book" size={12}/>{t('settlement')}
-          </button>
+          <button className="btn" onClick={()=>setPage('settlement')}><I name="book" size={12}/>{t('settlement')}</button>
         </div>
       </div>
     );
   }
 
-  // Close cart on Escape (mobile sheet UX)
-  useEffect(()=>{
-    if(!cartOpen) return;
-    const h = e => { if(e.key==='Escape') setCartOpen(false); };
-    window.addEventListener('keydown', h);
-    return ()=> window.removeEventListener('keydown', h);
-  },[cartOpen]);
-
-  const visible = state.products.filter(p=>p.visible && p.stock>0
-    && (catFilter? p.category===catFilter : true)
-    && (search? p.name.toLowerCase().includes(search.toLowerCase()) : true));
-
   function add(p){
     setCart(c=>{
       const ex = c.find(x=>x.productId===p.id);
       if(ex) return c.map(x=>x.productId===p.id?{...x,qty:x.qty+1}:x);
-      return [...c, {productId:p.id, name:p.name, price:p.hargaFinal, qty:1}];
+      return [...c, {productId:p.id, name:p.name, price:p.hargaFinal, qty:1, category:p.category, note:''}];
     });
   }
   function setQty(id,q){
     if(q<=0) return setCart(c=>c.filter(x=>x.productId!==id));
     setCart(c=>c.map(x=>x.productId===id?{...x,qty:q}:x));
   }
-  const subtotal = cart.reduce((s,x)=>s+x.price*x.qty,0);
+  function setItemNote(id, note){ setCart(c=>c.map(x=>x.productId===id?{...x,note}:x)); }
+  function clearCart(){ setCart([]); setCustomer(''); setTableNo(''); setEditingBill(null); setChannel('Walk-in'); }
+
+  // Print kitchen/bar station tickets for given items
+  async function printStations(order, itemsToPrint){
+    const routes = routeItemsToStations(itemsToPrint, state.settings.printStations, state.products);
+    for(const r of routes){
+      const bytes = buildStationTicketBytes(order, r.station.name, r.items, state.settings.printerWidth||32);
+      const sp = printerManager.get(r.station.id);
+      try{
+        if(sp.connected) await sp.send(bytes);
+        else if(printerSingleton.connected) await printerSingleton.send(bytes);
+      }catch(e){ /* silent — station printer may be offline */ }
+    }
+  }
+
+  // Core commit — handles new order, open bill save, and finalize
+  function buildOrder(status, paid, paymentMethod){
+    const items = cart.map(c=>({...c, subtotal: c.price*c.qty}));
+    const now = new Date();
+    return {
+      id: editingBill?.id || 'o'+Date.now(),
+      date: editingBill?.date || todayISO(),
+      time: editingBill?.time || now.toTimeString().slice(0,5),
+      openedAt: editingBill?.openedAt || now.toISOString(),
+      paidAt: status==='paid' ? now.toISOString() : null,
+      items, total: subtotal,
+      paid: status==='paid' ? paid : 0,
+      paymentMethod: status==='paid' ? paymentMethod : null,
+      channel, customer: customer||'Walk-in', tableNo: tableNo||'',
+      status,
+    };
+  }
+
+  function saveOpenBill(){
+    if(cart.length===0){ toast(t('empty_cart_warn'),'warn'); return; }
+    if(!customer || !customer.trim()){ toast('Nama customer wajib untuk open bill','warn'); return; }
+    const o = buildOrder('open');
+    const oldItems = editingBill?.items || [];
+    const newDelta = deltaItems(oldItems, o.items);
+    update(s=>{
+      const cu = upsertCustomer(s.customers, customer, '');
+      const products = applyInventoryDelta(s.products, oldItems, o.items);
+      const orders = editingBill ? s.orders.map(x=>x.id===o.id?o:x) : [o, ...s.orders];
+      return { orders, products, customers: cu.customers };
+    });
+    if(newDelta.length) printStations(o, newDelta);
+    toast(`${t('bill_saved')} ${o.customer}${o.tableNo?(' · '+t('table')+' '+o.tableNo):''}`,'ok');
+    clearCart();
+    setCartOpen(false);
+  }
 
   function checkout(){
-    if(cart.length===0){ toast('Cart kosong','warn'); return; }
+    if(cart.length===0){ toast(t('empty_cart_warn'),'warn'); return; }
     setPaymentOpen(true);
   }
 
   async function completeOrder(paid, paymentMethod='Cash'){
-    const o = {
-      id:'o'+Date.now(), date:todayISO(),
-      time: new Date().toTimeString().slice(0,5),
-      items: cart.map(c=>({...c, subtotal: c.price*c.qty})),
-      total: subtotal, paid, paymentMethod, channel, customer: customer||'Walk-in', status:'paid'
-    };
-    update(s=>({
-      orders:[o, ...s.orders],
-      products: s.products.map(p=>{
-        const cit = cart.find(c=>c.productId===p.id);
-        return cit ? {...p, stock: Math.max(0, p.stock - cit.qty)} : p;
-      })
-    }));
+    const o = buildOrder('paid', paid, paymentMethod);
+    const oldItems = editingBill?.items || [];
+    const newDelta = deltaItems(oldItems, o.items);
+    update(s=>{
+      const cu = upsertCustomer(s.customers, customer, '');
+      let customers = cu.customers;
+      if(cu.customer) customers = customers.map(c=> c.id===cu.customer.id ? {...c, totalSpent:(c.totalSpent||0)+subtotal} : c);
+      const products = applyInventoryDelta(s.products, oldItems, o.items);
+      const orders = editingBill ? s.orders.map(x=>x.id===o.id?o:x) : [o, ...s.orders];
+      return { orders, products, customers };
+    });
     setLastOrder(o);
-    setCart([]); setCustomer(''); setPaymentOpen(false);
-    toast(`Order tersimpan · ${fmtIDR(subtotal)} · Notif ke ${state.settings.waGroup}`,'ok');
-    // Auto print to thermal printer if connected
+    setPaymentOpen(false);
+    clearCart();
+    setCartOpen(false);
+    toast(`Order tersimpan · ${fmtIDR(o.total)}`,'ok');
+    // Print customer receipt
     if(state.settings.printerAutoPrint && printerSingleton.connected){
-      try{
-        await printerSingleton.send(buildReceiptBytes(o, state.settings, state.settings.printerWidth||32));
-        toast('Struk terkirim ke printer','ok');
-      }catch(err){
-        toast('Print thermal gagal: '+err.message+' — pakai browser print','warn');
-      }
+      try{ await printerSingleton.send(buildReceiptBytes(o, state.settings, state.settings.printerWidth||32)); }
+      catch(err){ toast('Print struk gagal: '+err.message,'warn'); }
     }
+    // Print station tickets for newly added items
+    if(newDelta.length) printStations(o, newDelta);
+  }
+
+  function loadBill(bill){
+    setEditingBill(bill);
+    setCart((bill.items||[]).map(it=>({ productId:it.productId, name:it.name, price:it.price, qty:it.qty, category:it.category, note:it.note||'' })));
+    setCustomer(bill.customer||'');
+    setTableNo(bill.tableNo||'');
+    setChannel(bill.channel||'Walk-in');
+    setTab('order');
+    setCartOpen(true);
+    toast(`Bill ${bill.customer} dimuat — tambah item atau selesaikan`,'ok');
+  }
+
+  function voidBill(bill){
+    if(!confirm(t('confirm_void'))) return;
+    update(s=>({
+      // restore inventory
+      products: applyInventoryDelta(s.products, [], (bill.items||[]).map(it=>({productId:it.productId, qty:-it.qty}))),
+      orders: s.orders.map(o=>o.id===bill.id?{...o, status:'void', updatedAt:new Date().toISOString()}:o),
+    }));
+    toast('Bill dibatalkan, stok dikembalikan','ok');
   }
 
   return (
     <>
+    <div className="tabs no-print">
+      <div className={"tab "+(tab==='order'?'active':'')} onClick={()=>setTab('order')}>{t('order_tab')}</div>
+      {enableOpenBill && (
+        <div className={"tab "+(tab==='bills'?'active':'')} onClick={()=>setTab('bills')}>
+          {t('open_bills_tab')}{openBills.length>0 && <span style={{marginLeft:8,color:'var(--accent)',fontWeight:700}}>· {openBills.length}</span>}
+        </div>
+      )}
+    </div>
+
+    {tab==='bills' ? (
+      <OpenBillsView openBills={openBills} onLoad={loadBill} onVoid={voidBill} onPrint={setLastOrder} t={t}/>
+    ) : (
     <div className="pos-grid">
       <div>
-        <div className="row mb-md" style={{padding:'8px 0',borderBottom:'1px solid var(--border)'}}>
-          <I name="search" size={14} color="var(--gold)"/>
-          <input className="input" placeholder="Cari menu…" value={search} onChange={e=>setSearch(e.target.value)} style={{flex:1,minWidth:160}}/>
+        <div className="row mb-md" style={{padding:'8px 0',borderBottom:'1px solid var(--border)',flexWrap:'wrap'}}>
+          <I name="search" size={14} color="var(--accent)"/>
+          <input className="input" placeholder={state.settings.businessName?'Cari menu…':'Cari menu…'} value={search} onChange={e=>setSearch(e.target.value)} style={{flex:1,minWidth:140}}/>
           <select className="select" value={catFilter} onChange={e=>setCatFilter(e.target.value)} style={{maxWidth:160}}>
-            <option value="">Semua</option>
-            <option>Roast Beans</option><option>Green Beans</option><option>Fallen Liquid</option>
+            <option value="">{t('all_categories')}</option>
+            {categories.map(c=> <option key={c} value={c}>{c}</option>)}
           </select>
-          <select className="select" value={channel} onChange={e=>setChannel(e.target.value)} style={{maxWidth:160}}>
-            <option>Walk-in</option><option>App</option><option>Web</option><option>Wholesale</option>
+          <select className="select" value={channel} onChange={e=>setChannel(e.target.value)} style={{maxWidth:140}}>
+            <option>Walk-in</option><option>App</option><option>Web</option><option>Wholesale</option><option>Dine-in</option><option>Takeaway</option>
           </select>
-        </div>
-        <div className="menu-grid">
-          {visible.map(p=>(
-            <div key={p.id} className="menu-tile" onClick={()=>add(p)}>
-              <div className="meta">{p.category} · {p.weight}g</div>
-              <div className="name">{p.name}</div>
-              {p.roastLevel!=='—' && <span className="roast-pill" style={{'--bg':ROAST_COLORS[p.roastLevel],marginTop:6}}>{p.roastLevel}</span>}
-              <div className="price">{fmtIDR(p.hargaFinal)}</div>
-              <div className="tiny dim mt-sm" style={{fontFamily:'var(--mono)',letterSpacing:'.1em'}}>Stok {p.stock}</div>
-            </div>
-          ))}
-          {visible.length===0 && <div className="muted" style={{padding:40,gridColumn:'1/-1',textAlign:'center',background:'var(--maroon)'}}>Tidak ada produk yang cocok.</div>}
         </div>
 
-        <div className="mt-lg">
-          <div className="sec-mark"><span className="label">Hari ini</span><span className="line"/></div>
+        {/* Menu grouped by category */}
+        {Object.keys(grouped).length===0 && (
+          <div className="muted" style={{padding:40,textAlign:'center',background:'var(--bg-2)',border:'1px solid var(--border)'}}>Tidak ada produk yang cocok.</div>
+        )}
+        {Object.entries(grouped).map(([cat,prods])=>(
+          <div key={cat} className="mb-md">
+            <div className="sec-mark" style={{margin:'4px 0 10px'}}><span className="label">{cat}</span><span className="line"/></div>
+            <div className="menu-grid">
+              {prods.map(p=>(
+                <div key={p.id} className="menu-tile" onClick={()=>add(p)}>
+                  <div className="meta">{p.category}{p.weight>0?` · ${p.weight}g`:''}</div>
+                  <div className="name">{p.name}</div>
+                  {p.roastLevel && p.roastLevel!=='—' && <span className="roast-pill" style={{'--bg':ROAST_COLORS[p.roastLevel],marginTop:6}}>{p.roastLevel}</span>}
+                  <div className="price">{fmtIDR(p.hargaFinal)}</div>
+                  {p.stock<999 && <div className="tiny dim mt-sm" style={{fontFamily:'var(--mono)',letterSpacing:'.1em'}}>Stok {p.stock}</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+
+        <div className="mt-lg no-print">
+          <div className="sec-mark"><span className="label">{t('today')}</span><span className="line"/></div>
           <table className="tbl mt-md">
-            <thead><tr><th>Waktu</th><th>Channel</th><th>Customer</th><th>Items</th><th>Total</th><th></th></tr></thead>
+            <thead><tr><th>{t('table')}/Waktu</th><th>Channel</th><th>Customer</th><th>Items</th><th>Status</th><th>Total</th><th></th></tr></thead>
             <tbody>
-              {state.orders.filter(o=>o.date===todayISO()).slice(0,10).map(o=>(
-                <tr key={o.id} className="clickable" onClick={()=>setLastOrder(o)}>
-                  <td className="mono dim">{o.time}</td>
+              {state.orders.filter(o=>o.date===todayISO() && o.status!=='void').slice(0,12).map(o=>(
+                <tr key={o.id} className="clickable" onClick={()=>o.status==='open'?loadBill(o):setLastOrder(o)}>
+                  <td className="mono dim">{o.tableNo? <span className="pill maroon">{t('table')} {o.tableNo}</span> : o.time}</td>
                   <td><span className="pill">{o.channel}</span></td>
                   <td className="dim">{o.customer}</td>
                   <td className="dim">{o.items.length} item</td>
+                  <td>{o.status==='open' ? <span className="pill warn">OPEN</span> : <span className="pill ok">PAID</span>}</td>
                   <td className="mono" style={{color:'var(--accent)'}}>{fmtIDR(o.total)}</td>
-                  <td><button className="btn sm ghost icon" onClick={e=>{e.stopPropagation();setLastOrder(o);}}><I name="print" size={12}/></button></td>
+                  <td><button className="btn sm ghost icon" onClick={e=>{e.stopPropagation(); o.status==='open'?loadBill(o):setLastOrder(o);}}><I name={o.status==='open'?'edit':'print'} size={12}/></button></td>
                 </tr>
               ))}
-              {state.orders.filter(o=>o.date===todayISO()).length===0 && <tr><td colSpan={6} className="muted" style={{textAlign:'center',padding:24}}>Belum ada order hari ini.</td></tr>}
+              {state.orders.filter(o=>o.date===todayISO() && o.status!=='void').length===0 && <tr><td colSpan={7} className="muted" style={{textAlign:'center',padding:24}}>{t('no_orders_today')}</td></tr>}
             </tbody>
           </table>
         </div>
@@ -5134,14 +5688,12 @@ function POSModule(){
         <div className="pos-cart-h">
           <div className="row" style={{justifyContent:'space-between'}}>
             <div>
-              <div className="label">N° 01 — {t('open_pos')}</div>
+              <div className="label">{editingBill ? `OPEN BILL · ${editingBill.customer}` : t('new_order')}</div>
               <h3 style={{fontSize:22,margin:'6px 0 0'}}>Cart</h3>
             </div>
             <div style={{textAlign:'right'}}>
               <div className="mono" style={{color:'var(--accent)',fontSize:18,fontWeight:600}}>{cart.length>0 ? fmtIDR(subtotal) : '—'}</div>
-              <button className="btn sm ghost no-print" style={{marginTop:6,display:'none'}} onClick={()=>setCartOpen(false)} aria-label="close cart">
-                <I name="close" size={12}/>
-              </button>
+              {editingBill && <button className="btn sm ghost" style={{marginTop:6}} onClick={clearCart}>{t('new_order')}</button>}
             </div>
           </div>
         </div>
@@ -5149,9 +5701,10 @@ function POSModule(){
           {cart.length===0 ? <div className="muted" style={{textAlign:'center',padding:40}}>{t('cart_empty')}</div> :
             cart.map(c=>(
               <div key={c.productId} className="cart-row">
-                <div>
+                <div style={{minWidth:0}}>
                   <div className="bright" style={{fontFamily:'var(--display)',fontSize:17}}>{c.name}</div>
                   <div className="tiny mono dim mt-sm">{fmtIDR(c.price)} × {c.qty}</div>
+                  <input className="input" value={c.note||''} onChange={e=>setItemNote(c.productId, e.target.value)} placeholder={t('add_note')} style={{fontSize:11,padding:'4px 0',marginTop:4}}/>
                 </div>
                 <div className="col" style={{alignItems:'flex-end',gap:6}}>
                   <div className="qty">
@@ -5166,24 +5719,40 @@ function POSModule(){
           }
         </div>
         <div className="pos-cart-foot">
-          <div className="field"><label>{t('customer_optional')}</label><input className="input" value={customer} onChange={e=>setCustomer(e.target.value)} placeholder={t('customer_ph')}/></div>
-          <div className="row" style={{justifyContent:'space-between',margin:'18px 0 4px'}}>
-            <span className="label">{t('subtotal')}</span>
-            <span className="mono dim">{fmtIDR(subtotal)}</span>
+          <div className="row" style={{gap:10}}>
+            <div className="field" style={{flex:2,minWidth:0}}><label>{t('customer')}</label>
+              <input className="input" list="tn-customers" value={customer} onChange={e=>setCustomer(e.target.value)} placeholder={t('customer_ph')}/>
+              <datalist id="tn-customers">
+                {state.customers.map(c=> <option key={c.id} value={c.name}/>)}
+              </datalist>
+            </div>
+            {enableTables && (
+              <div className="field" style={{flex:1,minWidth:0}}><label>{t('table_no')}</label>
+                <input className="input mono" value={tableNo} onChange={e=>setTableNo(e.target.value)} placeholder="12"/>
+              </div>
+            )}
           </div>
-          <div className="row" style={{justifyContent:'space-between',marginBottom:18}}>
+          <div className="row" style={{justifyContent:'space-between',margin:'14px 0 14px'}}>
             <span className="label">{t('total')}</span>
-            <span style={{fontSize:28,color:'var(--accent)',fontFamily:'var(--display)',fontWeight:600}}>{fmtIDR(subtotal)}</span>
+            <span style={{fontSize:26,color:'var(--accent)',fontFamily:'var(--display)',fontWeight:600}}>{fmtIDR(subtotal)}</span>
           </div>
-          <button className="btn primary" style={{width:'100%',justifyContent:'center',padding:'16px'}} onClick={()=>{setCartOpen(false); checkout();}} disabled={cart.length===0}>
-            <I name="check" size={13}/>{t('checkout')}
-          </button>
+          <div className="row" style={{gap:8}}>
+            {enableOpenBill && (
+              <button className="btn" style={{flex:1,justifyContent:'center',padding:'14px'}} onClick={saveOpenBill} disabled={cart.length===0}>
+                <I name="book" size={13}/>{editingBill? t('add_to_bill') : t('save_bill')}
+              </button>
+            )}
+            <button className="btn primary" style={{flex:1,justifyContent:'center',padding:'14px'}} onClick={()=>{setCartOpen(false); checkout();}} disabled={cart.length===0}>
+              <I name="check" size={13}/>{editingBill? t('finalize') : t('pay_now')}
+            </button>
+          </div>
         </div>
       </aside>
     </div>
+    )}
 
     {/* Mobile floating cart button */}
-    {cart.length > 0 && !cartOpen && (
+    {tab==='order' && cart.length > 0 && !cartOpen && (
       <button className="cart-fab no-print" onClick={()=>setCartOpen(true)}>
         <I name="pos" size={14}/>
         <span className="badge">{cart.reduce((s,c)=>s+c.qty,0)}</span>
@@ -5202,16 +5771,68 @@ function POSModule(){
   );
 }
 
+/* Open Bills view */
+function OpenBillsView({ openBills, onLoad, onVoid, onPrint, t }){
+  const total = openBills.reduce((s,o)=>s+o.total,0);
+  return (
+    <div className="col gap-md">
+      <div className="row" style={{justifyContent:'space-between',flexWrap:'wrap',gap:14,padding:'8px 0',borderBottom:'1px solid var(--border)'}}>
+        <div className="label">{t('unpaid_bills')}</div>
+        <div className="row gap-md">
+          <span className="pill warn">{openBills.length} {t('open_bills_count')}</span>
+          <span className="mono" style={{color:'var(--accent)',fontWeight:600}}>{fmtIDR(total)}</span>
+        </div>
+      </div>
+      {openBills.length===0 ? (
+        <div className="muted" style={{textAlign:'center',padding:50}}>{t('no_open_bills')}</div>
+      ) : (
+        <div className="grid-3">
+          {openBills.map(o=>(
+            <div key={o.id} className="card" style={{padding:18}}>
+              <div className="row" style={{justifyContent:'space-between',alignItems:'flex-start'}}>
+                <div>
+                  {o.tableNo && <span className="pill maroon" style={{marginBottom:6}}>{t('table')} {o.tableNo}</span>}
+                  <h3 style={{fontSize:22,margin:'6px 0 2px'}}>{o.customer}</h3>
+                  <div className="tiny dim">{t('open_since')} {o.time} · {o.items.length} {t('items_count')}</div>
+                </div>
+                <div className="mono" style={{color:'var(--accent)',fontSize:18,fontWeight:600}}>{fmtIDR(o.total)}</div>
+              </div>
+              <div className="mt-md" style={{borderTop:'1px solid var(--border)',paddingTop:10}}>
+                {o.items.slice(0,5).map((it,i)=>(
+                  <div key={i} className="row tiny dim" style={{justifyContent:'space-between',padding:'3px 0'}}>
+                    <span>{it.qty}× {it.name}</span><span className="mono">{fmtIDR(it.subtotal)}</span>
+                  </div>
+                ))}
+                {o.items.length>5 && <div className="tiny muted mt-sm">+{o.items.length-5} item lain…</div>}
+              </div>
+              <div className="row mt-md" style={{gap:8}}>
+                <button className="btn primary sm" style={{flex:1,justifyContent:'center'}} onClick={()=>onLoad(o)}><I name="edit" size={11}/>{t('add_to_bill')} / {t('finalize')}</button>
+                <button className="btn sm ghost icon" onClick={()=>onPrint(o)} title="Print"><I name="print" size={12}/></button>
+                <button className="btn sm danger icon" onClick={()=>onVoid(o)} title={t('void_bill')}><I name="trash" size={12}/></button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PaymentModal({total,onPay,onClose}){
   const [method,setMethod] = useState('Cash');
   const [paid,setPaid] = useState(total);
   const change = paid - total;
+  // Non-cash methods: auto-match paid to total (no change due)
+  function pickMethod(m){
+    setMethod(m);
+    if(m !== 'Cash') setPaid(total);
+  }
   return (
     <Modal title="Pembayaran" onClose={onClose}>
       <div className="col gap-md">
         <div className="row">
           {['Cash','QRIS','Transfer','Card'].map(m=>(
-            <button key={m} className={"btn "+(method===m?'primary':'ghost')} onClick={()=>setMethod(m)}>{m}</button>
+            <button key={m} className={"btn "+(method===m?'primary':'ghost')} onClick={()=>pickMethod(m)}>{m}</button>
           ))}
         </div>
         <div className="grid-2 mt-md">
@@ -5445,12 +6066,41 @@ function SettingsModule(){
   const [connecting,setConnecting] = useState(false);
   const [printerName,setPrinterName] = useState(printerSingleton.lastName||'');
   const printerStatus = connecting ? 'connecting' : (printerConnected ? 'connected' : 'idle');
+  // Re-sync local form when global state changes (e.g. via live update from sub-sections)
+  // This prevents local s from going stale and overwriting live changes on Save.
+  useEffect(()=>{
+    // Only resync nested objects that have live update — keep user's pending top-level edits
+    setS(prev => ({
+      ...prev,
+      theme: state.settings.theme,
+      brand: state.settings.brand,
+      printStations: state.settings.printStations,
+      categories: state.settings.categories,
+      enableOpenBill: state.settings.enableOpenBill,
+      enableTables: state.settings.enableTables,
+      customerPruneMonths: state.settings.customerPruneMonths,
+    }));
+  },[state.settings.theme, state.settings.brand, state.settings.printStations, state.settings.categories]);
   function set(k,v){ setS(st=>({...st,[k]:v})); }
-  function save(){ update({settings:s}); toast('Settings disimpan','ok'); }
+  function save(){
+    update({settings:s});
+    toast('Settings disimpan','ok');
+  }
 
   async function testSync(){
     setTesting(true);
     try{
+      // Validate URL format
+      if(!s.syncEndpoint){ throw new Error('Endpoint kosong'); }
+      if(!/^https?:\/\//i.test(s.syncEndpoint)){
+        throw new Error('URL harus dimulai dengan https:// atau http://');
+      }
+      if(s.syncEndpoint.includes('/edit') || s.syncEndpoint.includes('script.google.com/d/')){
+        throw new Error('Itu URL editor — pakai URL Web App (.../exec) dari Deploy → New deployment');
+      }
+      if(!s.syncEndpoint.endsWith('/exec') && !s.syncEndpoint.includes('script.google.com/macros/s/')){
+        throw new Error('URL tidak terlihat seperti Apps Script Web App (harusnya berakhir /exec)');
+      }
       const r = await SyncSvc.test(s.syncEndpoint, s.syncSecret);
       toast('Connected · v'+(r.version||'?')+' · '+(r.time||''),'ok');
     }catch(err){
@@ -5493,18 +6143,41 @@ function SettingsModule(){
   }
 
   function copyToClipboard(text){
-    navigator.clipboard?.writeText(text);
-    toast('Tersalin ke clipboard','ok');
+    if(!text){ toast('Tidak ada yang disalin','warn'); return; }
+    if(navigator.clipboard && window.isSecureContext){
+      navigator.clipboard.writeText(text)
+        .then(()=> toast('Tersalin ke clipboard','ok'))
+        .catch(()=> fallbackCopy(text));
+    } else {
+      fallbackCopy(text);
+    }
+    function fallbackCopy(txt){
+      try{
+        const ta = document.createElement('textarea');
+        ta.value = txt; ta.style.position='fixed'; ta.style.left='-9999px';
+        document.body.appendChild(ta); ta.select();
+        document.execCommand('copy');
+        ta.remove();
+        toast('Tersalin ke clipboard','ok');
+      }catch(e){ toast('Copy gagal — salin manual','err'); }
+    }
   }
   const webhookURL = s.syncEndpoint
     ? `${s.syncEndpoint}${s.syncEndpoint.includes('?')?'&':'?'}action=webhook&secret=${encodeURIComponent(s.syncSecret||'YOUR_SECRET')}`
     : '';
   function exportData(){
-    const blob = new Blob([JSON.stringify(state,null,2)], {type:'application/json'});
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `taring-naga-lab-backup-${todayISO()}.json`;
-    a.click();
+    try{
+      const blob = new Blob([JSON.stringify(state,null,2)], {type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `taring-naga-lab-backup-${todayISO()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(()=> URL.revokeObjectURL(url), 1500);
+      toast('Backup terunduh','ok');
+    }catch(e){ toast('Export gagal: '+e.message,'err'); }
   }
   function importData(e){
     const f = e.target.files[0]; if(!f) return;
@@ -5512,12 +6185,22 @@ function SettingsModule(){
     r.onload = ()=>{
       try{
         const data = JSON.parse(r.result);
-        if(!confirm('Restore akan menimpa data saat ini. Lanjut?')) return;
+        // Validation — must have required top-level keys
+        if(!data || typeof data !== 'object'){ throw new Error('Format tidak valid'); }
+        const required = ['settings','beans','products'];
+        for(const k of required){
+          if(data[k] === undefined){ throw new Error('Missing field: '+k); }
+        }
+        if(!confirm('Restore akan menimpa SEMUA data lokal saat ini (user, settings, transaksi). Lanjut?')) return;
         localStorage.setItem(STORE_KEY, JSON.stringify(data));
-        location.reload();
-      }catch(err){ toast('File tidak valid','err'); }
+        toast('Restore berhasil — reloading…','ok');
+        setTimeout(()=> location.reload(), 600);
+      }catch(err){ toast('File tidak valid: '+err.message,'err'); }
     };
+    r.onerror = ()=> toast('Gagal baca file','err');
     r.readAsText(f);
+    // Reset input so re-uploading same file works
+    e.target.value = '';
   }
   function reset(){
     if(!confirm('Reset ke data demo? Semua perubahan akan hilang.')) return;
@@ -5768,8 +6451,11 @@ function SettingsModule(){
         </div>
       </div>
 
+      {/* CAFÉ POS — print stations + categories */}
+      <CafePOSSection s={s} set={set} update={update} state={state} t={t} toast={toast}/>
+
       <div>
-        <div className="sec-mark"><span className="label">N° 08 — Data</span><span className="line"/></div>
+        <div className="sec-mark"><span className="label">N° 13 — Data</span><span className="line"/></div>
         <h3 style={{fontSize:'clamp(26px, 3vw, 36px)',margin:'10px 0 24px'}}>Backup & <em>Restore</em></h3>
         <div className="row">
           <button className="btn" onClick={exportData}><I name="download" size={12}/>Export JSON</button>

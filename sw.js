@@ -6,7 +6,7 @@
  *  - Apps Script sync API: network-first with offline queue (handled in app)
  */
 
-const VERSION = 'tn-lab-v1.4.1';
+const VERSION = 'tn-lab-v1.6.0';
 const SHELL_CACHE = `${VERSION}-shell`;
 const CDN_CACHE = `${VERSION}-cdn`;
 
